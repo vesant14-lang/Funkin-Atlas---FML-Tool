@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose an improvement to the standalone explorer
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [Characters, Stages, Songs, Export, User interface, Shared FML core, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include Psych, Codename or V-Slice differences if relevant.

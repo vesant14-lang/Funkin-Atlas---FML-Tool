@@ -1,0 +1,36 @@
+name: Bug report
+description: Report a reproducible character, stage, song or export problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Funkin Atlas version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Source engine
+      options: [Psych Engine, Codename Engine, V-Slice, Other or unknown]
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Use a synthetic fixture where possible; do not upload copyrighted mod assets without permission.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics or screenshots
+      description: Remove personal paths and private data before posting.
