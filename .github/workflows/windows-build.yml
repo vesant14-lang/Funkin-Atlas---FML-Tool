@@ -1,0 +1,19 @@
+name: Windows build
+on:
+  push:
+  pull_request:
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Funkin Atlas
+        shell: cmd
+        run: build.bat check
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: FunkinAtlas-Windows-check
+          path: |
+            FunkinAtlas-check.exe
+            SDL3.dll
