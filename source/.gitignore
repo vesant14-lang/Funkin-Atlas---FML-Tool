@@ -1,0 +1,17 @@
+/build/
+/*.exe
+/*.dll
+/*.pdb
+/*.obj
+/imgui.ini
+/.vs/
+/.vscode/
+/*.png
+/*.gif
+/*.zip
+/mods/
+/captures/
+/exports/
+*.user
+*.suo
+*.tmp
