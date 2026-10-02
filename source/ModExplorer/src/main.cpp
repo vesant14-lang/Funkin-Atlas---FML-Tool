@@ -2,6 +2,10 @@
 #include "../../src/fml_app/AnimationGif.hpp"
 #include "../../src/fml_app/GifWriter.hpp"
 #include "../../src/fml_app/MountedSheet.hpp"
+#include "../../src/fml_app/AnimateSparrow.hpp"
+#include "../../src/fml_app/CharacterVisual.hpp"
+#include "../../src/fml_app/ExportReview.hpp"
+#include "../../src/fml_app/PsychVisualStage.hpp"
 #include "../../src/fml_formats/VSliceExport.hpp"
 #include "../../src/fml_formats/PsychCharacter.hpp"
 #include "../../src/fml_formats/PsychStage.hpp"
@@ -11,11 +15,14 @@
 #include "../../src/fml_formats/SongMeta.hpp"
 #include "../../src/fml_formats/ChartExchange.hpp"
 #include "../../src/fml_formats/PsychSongAudio.hpp"
+#include "../../src/fml_formats/SongScriptAudio.hpp"
 #include "../../src/fml_render/GlRenderer.hpp"
+#include "../../src/fml_core/TextEncoding.hpp"
 #include "../../third_party/json.hpp"
 #include "../../third_party/miniz/miniz.h"
 #include "../../third_party/stb_image_write.h"
 #include "../../third_party/imgui/imgui.h"
+#include "../../third_party/imgui/imgui_internal.h"
 #include "../../third_party/imgui/imgui_impl_sdl3.h"
 #include "../../third_party/imgui/imgui_impl_opengl3.h"
 
@@ -25,6 +32,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +44,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -44,11 +53,15 @@
 #include <shellapi.h>
 #endif
 
+#include "StageAssetViewer.hpp"
+
 namespace {
 
 using namespace fml;
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+
+constexpr size_t kMaxLoadedMods = 5;
 
 struct LoadedMod {
     ModExplorerCatalog catalog;
@@ -56,7 +69,58 @@ struct LoadedMod {
     std::string singleFile;
 };
 
-enum class DialogAction { None, Add, AddSingle, ManualDefinition, ManualImage, ManualAtlas, ManualSpritemap, ManualIcon, Recover, Export, AnimationGif, AnimationPng, MountedSheet, PairGifs, PairSceneGif, StageGif, StageSheet, StageZip, StageObjectPng, StageScenePng, StageSceneGif };
+enum class DialogAction { None, Add, AddSingle, ManualDefinition, ManualImage, ManualAtlas, ManualSpritemap, ManualIcon, Recover, Export, BatchExport, AnimationGif, AnimationPng, MountedSheet, PairGifs, PairSceneGif, StageGif, StageSheet, StageZip, StageObjectPng, StageScenePng, StageSceneGif, AssetPosePng, AssetAnimationGif, AssetMountedSheet, AssetSourceZip, AssetBlockPng, AssetAnimationBatch };
+
+struct ResourceReference {
+    std::string root, key;
+    bool operator==(const ResourceReference& other) const { return root == other.root && key == other.key; }
+};
+
+struct ExportJob {
+    ResourceReference source;
+    std::string label;
+    ResourceExportReview review;
+    std::string result;
+    bool done = false, success = false, reviewed = false;
+};
+
+struct ExportQueueState {
+    std::vector<ExportJob> jobs;
+    fs::path folder;
+    int target = 2;
+    size_t next = 0;
+    size_t reviewNext = 0;
+    bool open = false, appearing = false, running = false, reviewing = false, cancel = false;
+    std::string manifest;
+};
+
+struct ExportReviewState {
+    ResourceReference source;
+    ResourceExportReview review;
+    int target = 2;
+    bool open = false, appearing = false;
+};
+
+struct CompareSlot {
+    ResourceReference source;
+    std::string label, error;
+    UniversalStage stage;
+    UniversalCharacter character;
+    GlRenderer renderer;
+    AtlasStore atlases;
+    StageAnimator animator;
+    ViewportTransform view;
+    int animation = 0;
+    bool ready = false, characterMode = false, viewValid = false;
+};
+
+struct ComparisonState {
+    CompareSlot slots[2];
+    bool open = false, appearing = false, playing = true;
+    int mode = 0;
+    float blend = 0.5f;
+    atlas_ui::AssetCanvasView canvas;
+};
 
 struct AtlasSequenceStep { int animation = 0; int repeat = 1; };
 struct CustomPose { bool traced = false; int index = 0; };
@@ -86,6 +150,7 @@ struct MountedViewCache {
 };
 
 struct LiveSheetViewState {
+    std::string image;
     float zoom = 1.0f;
     ImVec2 pan{0.0f, 0.0f};
     bool panning = false;
@@ -95,6 +160,7 @@ struct LiveSheetViewState {
     ImVec2 boundsMax{0.0f, 0.0f};
     ImVec2 wheelPos{0.0f, 0.0f};
     float wheel = 0.0f;
+    SDL_WindowID windowId = 0;
 };
 
 struct StageScriptInventory {
@@ -109,6 +175,8 @@ struct SongLabEntry {
     std::string collectionLabel;
     std::string id;
     std::string difficulty;
+    int difficultyOrder = 1000;
+    std::string variation;
     std::string path;
     std::string metadataPath;
     std::string stage;
@@ -122,6 +190,11 @@ struct SongLabState {
     std::vector<SongLabEntry> songs;
     SongLabEntry activeSong;
     std::vector<std::string> audioPaths;
+    std::vector<float> audioTrackVolumes;
+    std::vector<SongScriptAudioCue> scriptAudioCues;
+    std::vector<SongScriptAudioIssue> scriptAudioIssues;
+    std::vector<std::string> scriptPaths;
+    std::vector<int> strumlineTracks;
     std::string indexedSignature;
     std::string activeRoot;
     std::string activeLabel;
@@ -134,10 +207,12 @@ struct SongLabState {
     int selected = -1;
     int audioMode = 2;
     int instTrack = -1;
+    int scriptAudioCueIndex = -2;
     float masterVolume = 1.0f;
     float instVolume = 1.0f;
     float voicesVolume = 1.0f;
     bool loopSong = false;
+    bool applyScriptAudio = false;
     bool onlyRelated = false;
     bool indexed = false;
     bool autoPlay = false;
@@ -234,6 +309,12 @@ struct AtlasTabState {
 };
 
 struct AtlasApp {
+    atlas_ui::StageAssetViewerState assetViewer;
+    ExportQueueState exportQueue;
+    ExportReviewState exportReview;
+    ComparisonState comparison;
+    std::vector<std::string> droppedPaths;
+    bool dropActive = false;
     std::vector<std::unique_ptr<LoadedMod>> mods;
     GlRenderer renderer;
     GlRenderer quickRenderer;
@@ -257,6 +338,7 @@ struct AtlasApp {
     std::vector<AtlasFrame> tracedFrames;
     std::map<std::string, std::vector<SavedPoseAnimation>> savedAnimations;
     std::map<std::string, int> characterSongLines;
+    std::map<std::string, int> characterSheetPages;
     std::map<std::string, std::array<std::string, 4>> songAnimationActions;
     std::map<std::string, std::string> songAnimationIdles;
     std::map<std::string, std::vector<SongAnimationPreset>> songAnimationPresets;
@@ -284,6 +366,7 @@ struct AtlasApp {
     float sheetZoom = 1.0f;
     bool sheetPanning = false;
     bool sheetBoundsValid = false;
+    SDL_WindowID sheetWindowId = 0;
     ImVec2 sheetBoundsMin{0.0f, 0.0f};
     ImVec2 sheetBoundsMax{0.0f, 0.0f};
     ImVec2 sheetWheelPos{0.0f, 0.0f};
@@ -296,6 +379,7 @@ struct AtlasApp {
     std::string statusEn;
     std::string capturePath;
     int captureDetailScroll = 0;
+    int captureLeftScroll = 0;
     std::string dialogPath;
     std::mutex dialogMutex;
     std::array<char, 2048> root{};
@@ -309,6 +393,11 @@ struct AtlasApp {
     std::array<char, 64> animationFilter{};
     int selectedMod = -1;
     int selectedAsset = -1;
+    std::array<float, 3> panelWeights{0.25f, 0.52f, 0.23f};
+    std::array<float, 2> previewHeights{0.0f, 0.0f};
+    std::array<bool, 3> panelDetached{false, false, false};
+    int leftPanelTab = 0;
+    bool selectLeftPanelTab = true;
     int renderMod = -1;
     int quickRenderMod = -1;
     int quickMod = -1;
@@ -390,6 +479,7 @@ struct AtlasApp {
     int characterFrameHeight = 0;
     bool previewPanning = false;
     bool previewBoundsValid = false;
+    SDL_WindowID previewWindowId = 0;
     ImVec2 previewBoundsMin{0.0f, 0.0f};
     ImVec2 previewBoundsMax{0.0f, 0.0f};
     ImVec2 previewWheelPos{0.0f, 0.0f};
@@ -430,8 +520,8 @@ std::string diagnosticText(const std::string& message, bool spanish) {
         return "The character has no image declaration; there is no atlas to draw.";
     if (message.find("el personaje no declara ninguna animacion") == 0)
         return "The character has no animations; it would remain still without idle in game.";
-    if (message.find(" atlas separados por comas; Psych") != std::string::npos)
-        return "The image field names multiple atlases. Psych combines them, but this preview uses the first; the original paths are preserved.";
+    if (message.find(" atlas separados por comas;") != std::string::npos)
+        return "The image field names multiple atlases; every page must resolve. Psych multi-atlas characters require a compatible 1.x engine.";
     if (message.find("la animacion numero ") == 0)
         return "An animation has no logical name and was ignored.";
     if (message.find("la animacion ") == 0 && message.find("no declara prefijo") != std::string::npos)
@@ -472,18 +562,23 @@ std::string identity(const LoadedMod& mod, const ModExplorerAsset& asset) {
     return normalizedRoot(mod.catalog.root()) + "|" + asset.key;
 }
 
+// %LOCALAPPDATA% en UTF-16 (TextEncoding.hpp): con getenv llegaba en ANSI y
+// `u8path` lanzaba con un usuario como "José"; Atlas se cerraba al arrancar.
+fs::path settingsBase() {
+    const fs::path local = environmentPath("LOCALAPPDATA");
+    if (!local.empty()) return local;
+    std::error_code ec;
+    return fs::temp_directory_path(ec);
+}
+
 fs::path galleryPath() {
-    if (const char* custom = std::getenv("FUNKIN_ATLAS_GALLERY_PATH"))
-        if (*custom) return fs::u8path(custom);
-    const char* local = std::getenv("LOCALAPPDATA");
-    const fs::path base = local ? fs::u8path(local) : fs::temp_directory_path();
-    return base / "FunkinAtlas" / "gallery.json";
+    const fs::path custom = environmentPath("FUNKIN_ATLAS_GALLERY_PATH");
+    if (!custom.empty()) return custom;
+    return settingsBase() / "FunkinAtlas" / "gallery.json";
 }
 
 fs::path oldGalleryPath() {
-    const char* local = std::getenv("LOCALAPPDATA");
-    const fs::path base = local ? fs::u8path(local) : fs::temp_directory_path();
-    return base / "FmlModExplorer" / "gallery.json";
+    return settingsBase() / "FmlModExplorer" / "gallery.json";
 }
 
 void loadGallery(AtlasApp& app) {
@@ -511,6 +606,32 @@ void loadGallery(AtlasApp& app) {
                     if (it.value().is_number_integer()) app.engineOverrides[it.key()] = it.value().get<int>();
             const json language = data.value("language", json());
             if (language.is_string()) app.spanish = language.get<std::string>() != "en";
+            const json panelLayout = data.value("panelLayout", json::object());
+            if (panelLayout.is_object()) {
+                const json weights = panelLayout.value("weights", json::array());
+                if (weights.is_array() && weights.size() == 3) {
+                    bool valid = true;
+                    for (int i = 0; i < 3; ++i)
+                        if (!weights[i].is_number() || !std::isfinite(weights[i].get<float>()) ||
+                            weights[i].get<float>() < 0.01f || weights[i].get<float>() > 1.0f)
+                            valid = false;
+                    if (valid) for (int i = 0; i < 3; ++i)
+                        app.panelWeights[static_cast<size_t>(i)] = weights[i].get<float>();
+                }
+                const json detached = panelLayout.value("detached", json::array());
+                if (detached.is_array() && detached.size() == 3)
+                    for (int i = 0; i < 3; ++i)
+                        if (detached[i].is_boolean())
+                            app.panelDetached[static_cast<size_t>(i)] = detached[i].get<bool>();
+                const json previewHeights = panelLayout.value("previewHeights", json::array());
+                if (previewHeights.is_array() && previewHeights.size() == 2)
+                    for (int i = 0; i < 2; ++i)
+                        if (previewHeights[i].is_number() &&
+                            std::isfinite(previewHeights[i].get<float>()) &&
+                            previewHeights[i].get<float>() >= 0.0f &&
+                            previewHeights[i].get<float>() <= 1600.0f)
+                            app.previewHeights[static_cast<size_t>(i)] = previewHeights[i].get<float>();
+            }
             const json saved = data.value("customAnimations", json::object());
             if (saved.is_object()) {
                 for (auto it = saved.begin(); it != saved.end(); ++it) {
@@ -527,6 +648,7 @@ void loadGallery(AtlasApp& app) {
                             for (const json& frame : frames) {
                                 if (!frame.is_object() || animation.tracedFrames.size() >= 512) continue;
                                 AtlasFrame parsed;
+                                parsed.sourceImage = frame.value("sourceImage", std::string());
                                 parsed.x = frame.value("x", 0);
                                 parsed.y = frame.value("y", 0);
                                 parsed.w = frame.value("w", 0);
@@ -553,6 +675,12 @@ void loadGallery(AtlasApp& app) {
                 }
             }
             const json songActions = data.value("songAnimationActions", json::object());
+            const json songLines = data.value("songStrumlines", json::object());
+            if (songLines.is_object()) for (auto it = songLines.begin(); it != songLines.end(); ++it)
+                if (it.value().is_number_integer()) {
+                    const int line = it.value().get<int>();
+                    if (line >= -2 && line < 256) app.characterSongLines[it.key()] = line;
+                }
             if (songActions.is_object()) for (auto it = songActions.begin(); it != songActions.end(); ++it) {
                 if (!it.value().is_array() || it.value().size() != 4) continue;
                 std::array<std::string, 4> actions;
@@ -602,7 +730,7 @@ void loadGallery(AtlasApp& app) {
         const auto root = app.galleryRoots.find(key);
         if (root == app.galleryRoots.end()) continue;
         const std::string oldKey = key;
-        key = normalizedRoot(fs::u8path(root->second)) + "|" + oldKey;
+        key = normalizedRoot(pathFromUtf8(root->second)) + "|" + oldKey;
         app.galleryRoots[key] = root->second;
         const auto engine = app.engineOverrides.find(oldKey);
         if (engine != app.engineOverrides.end()) app.engineOverrides[key] = engine->second;
@@ -611,7 +739,10 @@ void loadGallery(AtlasApp& app) {
     app.gallery.erase(std::unique(app.gallery.begin(), app.gallery.end()), app.gallery.end());
 }
 
-bool saveGallery(const AtlasApp& app) {
+// Nunca lanza: se llama al salir y desde muchos controles. `json::dump`
+// lanzaba con un nombre de animacion que no es UTF-8 (mod guardado en ANSI);
+// con `replace` ese byte sale como U+FFFD y el resto se guarda.
+bool saveGallery(const AtlasApp& app) try {
     const fs::path target = galleryPath();
     std::error_code ec;
     fs::create_directories(target.parent_path(), ec);
@@ -625,6 +756,9 @@ bool saveGallery(const AtlasApp& app) {
         data["galleryRoots"] = app.galleryRoots;
         data["engineOverrides"] = app.engineOverrides;
         data["language"] = app.spanish ? "es" : "en";
+        data["panelLayout"] = {{"weights", app.panelWeights},
+                               {"detached", app.panelDetached},
+                               {"previewHeights", app.previewHeights}};
         json saved = json::object();
         for (const auto& [key, animations] : app.savedAnimations) {
             json items = json::array();
@@ -638,12 +772,13 @@ bool saveGallery(const AtlasApp& app) {
                     item["order"].push_back({{"traced", pose.traced}, {"index", pose.index}});
                 item["tracedFrames"] = json::array();
                 for (const AtlasFrame& frame : animation.tracedFrames)
-                    item["tracedFrames"].push_back({{"x", frame.x}, {"y", frame.y}, {"w", frame.w}, {"h", frame.h}});
+                    item["tracedFrames"].push_back({{"x", frame.x}, {"y", frame.y}, {"w", frame.w}, {"h", frame.h}, {"sourceImage", frame.sourceImage}});
                 items.push_back(std::move(item));
             }
             if (!items.empty()) saved[key] = std::move(items);
         }
         data["customAnimations"] = std::move(saved);
+        data["songStrumlines"] = app.characterSongLines;
         json songActions = json::object();
         for (const auto& [key, actions] : app.songAnimationActions)
             songActions[key] = actions;
@@ -660,7 +795,7 @@ bool saveGallery(const AtlasApp& app) {
             if (!entries.empty()) songPresets[key] = std::move(entries);
         }
         data["songAnimationPresets"] = std::move(songPresets);
-        output << data.dump(2);
+        output << data.dump(2, ' ', false, json::error_handler_t::replace);
         output.flush();
         if (!output) return false;
     }
@@ -671,6 +806,8 @@ bool saveGallery(const AtlasApp& app) {
     fs::rename(temporary, target, ec);
     return !ec;
 #endif
+} catch (...) {
+    return false;
 }
 
 const ModExplorerAsset* selectedAsset(const AtlasApp& app) {
@@ -1485,13 +1622,19 @@ bool addMod(AtlasApp& app, const fs::path& root) {
             return true;
         }
     }
-    if (app.mods.size() >= 3) {
-        setStatus(app, "Límite de tres mods: quita uno antes de añadir otro.", "Three-mod limit: remove one before adding another.");
+    if (app.mods.size() >= kMaxLoadedMods) {
+        setStatus(app, "Límite de cinco mods: quita uno antes de añadir otro.", "Five-mod limit: remove one before adding another.");
         return false;
     }
     auto mod = std::make_unique<LoadedMod>();
     if (!mod->catalog.scan(root)) {
-        setStatus(app, mod->catalog.error() == "The selected path is not a readable folder or ZIP archive." ? "La ruta no corresponde a una carpeta o ZIP legible." : mod->catalog.error(), mod->catalog.error());
+        const std::string& error = mod->catalog.error();
+        setStatus(app,
+            error == "The selected path is not a readable folder or ZIP archive."
+                ? "La ruta no corresponde a una carpeta o ZIP legible."
+            : error.rfind("The selected folder has more than", 0) == 0
+                ? "La carpeta tiene más de 250 000 archivos: elige la carpeta del mod, no una de más arriba."
+            : error, error);
         return false;
     }
     mod->label = root.filename().u8string();
@@ -1514,9 +1657,9 @@ bool addSingleResource(AtlasApp& app, const fs::path& file) {
             app.selectTabOnNextFrame = true;
             return true;
         }
-    if (app.mods.size() >= 3) {
-        setStatus(app, "Límite de tres fuentes cargadas; quita una antes de añadir otra.",
-                       "Three loaded sources maximum; remove one before adding another.");
+    if (app.mods.size() >= kMaxLoadedMods) {
+        setStatus(app, "Límite de cinco fuentes cargadas; quita una antes de añadir otra.",
+                       "Five loaded sources maximum; remove one before adding another.");
         return false;
     }
     auto mod = std::make_unique<LoadedMod>();
@@ -1553,8 +1696,8 @@ bool addManualResource(AtlasApp& app) {
                        "Choose a definition or a PNG image.");
         return false;
     }
-    if (app.mods.size() >= 3) {
-        setStatus(app, "Límite de tres fuentes cargadas.", "Three loaded sources maximum.");
+    if (app.mods.size() >= kMaxLoadedMods) {
+        setStatus(app, "Límite de cinco fuentes cargadas.", "Five loaded sources maximum.");
         return false;
     }
     auto mod = std::make_unique<LoadedMod>();
@@ -1591,6 +1734,8 @@ bool addManualResource(AtlasApp& app) {
 
 void removeMod(AtlasApp& app, int index) {
     if (index < 0 || index >= static_cast<int>(app.mods.size())) return;
+    const bool removedSelection = app.selectedMod == index;
+    const std::string removedRoot = normalizedRoot(app.mods[static_cast<size_t>(index)]->catalog.root());
     if (app.quickRenderMod >= 0) app.quickRenderer.shutdown();
     app.quickRenderMod = app.quickMod = app.quickAsset = -1;
     app.quickConfiguredMod = app.quickConfiguredAsset = -1;
@@ -1598,13 +1743,32 @@ void removeMod(AtlasApp& app, int index) {
     app.songLab.indexed = false;
     app.songLab.indexedSignature.clear();
     app.songLab.selected = -1;
-    if (app.rendererReady) app.renderer.shutdown();
-    app.rendererReady = false;
-    app.renderMod = -1;
+    const bool rebindRenderer = app.renderMod >= index;
+    if (rebindRenderer) {
+        if (app.rendererReady) app.renderer.shutdown();
+        app.rendererReady = false;
+        app.renderMod = -1;
+    }
     app.mods.erase(app.mods.begin() + index);
     app.stageScriptCache.clear();
-    app.selectedMod = app.selectedAsset = -1;
-    ensureSelection(app);
+    for (AtlasTabState& state : app.tabStates) {
+        if (!state.valid || state.root != removedRoot) continue;
+        const bool stillLoaded = std::any_of(app.mods.begin(), app.mods.end(), [&](const auto& source) {
+            if (normalizedRoot(source->catalog.root()) != state.root) return false;
+            const auto& assets = source->catalog.assets();
+            return std::any_of(assets.begin(), assets.end(), [&](const auto& resource) {
+                return resource.key == state.assetKey;
+            });
+        });
+        if (!stillLoaded) state.valid = false;
+    }
+    if (removedSelection) {
+        app.selectedMod = app.selectedAsset = -1;
+        ensureSelection(app);
+    } else {
+        if (app.selectedMod > index) --app.selectedMod;
+        if (rebindRenderer && app.selectedMod >= 0) activateRenderer(app, app.selectedMod);
+    }
 }
 
 std::string firstMissingGalleryKey(const AtlasApp& app) {
@@ -1621,20 +1785,42 @@ void replaceGalleryEntry(AtlasApp& app, int modIndex, const ModExplorerAsset& as
     if (app.pendingRecoveryKey.empty()) return;
     const std::string oldKey = app.pendingRecoveryKey;
     const std::string newKey = identity(*app.mods[static_cast<size_t>(modIndex)], asset);
+    const std::string oldRoot = oldKey.substr(0, oldKey.find('|'));
+    const std::string newSongRoot = app.mods[static_cast<size_t>(modIndex)]->catalog.root().u8string();
     for (std::string& key : app.gallery) if (key == oldKey) key = newKey;
     std::sort(app.gallery.begin(), app.gallery.end());
     app.gallery.erase(std::unique(app.gallery.begin(), app.gallery.end()), app.gallery.end());
-    const auto engine = app.engineOverrides.find(oldKey);
-    if (engine != app.engineOverrides.end()) {
-        app.engineOverrides[newKey] = engine->second;
-        app.engineOverrides.erase(engine);
+    if (oldKey != newKey) {
+        auto migrate = [&](auto& entries) {
+            for (auto it = entries.begin(); it != entries.end();) {
+                if (it->first == oldKey || it->first.rfind(oldKey + "|", 0) == 0) {
+                    std::string suffix = it->first.substr(oldKey.size());
+                    if (lower(suffix).rfind("|" + oldRoot + "|", 0) == 0)
+                        suffix = "|" + newSongRoot + suffix.substr(oldRoot.size() + 1);
+                    const std::string key = newKey + suffix;
+                    auto value = std::move(it->second);
+                    it = entries.erase(it);
+                    entries.insert_or_assign(key, std::move(value));
+                } else ++it;
+            }
+        };
+        migrate(app.engineOverrides);
+        migrate(app.savedAnimations);
+        migrate(app.characterSongLines);
+        migrate(app.songAnimationActions);
+        migrate(app.songAnimationIdles);
+        migrate(app.songAnimationPresets);
+        migrate(app.songAnimationDraftNames);
+        app.galleryRoots.erase(oldKey);
     }
-    const auto custom = app.savedAnimations.find(oldKey);
-    if (custom != app.savedAnimations.end()) {
-        app.savedAnimations[newKey] = std::move(custom->second);
-        app.savedAnimations.erase(custom);
+    app.songLab.viewDirty = true;
+    if (!app.songLab.activeRoot.empty() &&
+        normalizedRoot(fs::u8path(app.songLab.activeRoot)) == oldRoot) {
+        app.songLab.activeRoot = newSongRoot;
+        app.songLab.activeSong.sourceRoot = newSongRoot;
+        app.songLab.indexed = false;
+        app.songLab.indexedSignature.clear();
     }
-    app.galleryRoots.erase(oldKey);
     app.galleryRoots[newKey] = app.mods[static_cast<size_t>(modIndex)]->catalog.root().u8string();
     app.pendingRecoveryKey.clear();
     saveGallery(app);
@@ -1660,7 +1846,7 @@ fs::path availablePath(const fs::path& desired, bool directory) {
     if (!fs::exists(desired, ec)) return desired;
     for (int n = 2; n < 10000; ++n) {
         fs::path candidate = directory
-            ? fs::path(desired.u8string() + "-" + std::to_string(n))
+            ? fs::u8path(desired.u8string() + "-" + std::to_string(n))
             : desired.parent_path() / fs::u8path(desired.stem().u8string() + "-" + std::to_string(n) + desired.extension().u8string());
         if (!fs::exists(candidate, ec)) return candidate;
     }
@@ -1716,6 +1902,8 @@ bool exportOriginal(AtlasApp& app, const fs::path& folder) {
     if (asset->kind == ModExplorerAsset::Kind::Character) {
         const auto& character = std::get<UniversalCharacter>(asset->parsed);
         addSprite(character.resolvedImage, character.resolvedAtlas);
+        for (size_t page = 0; page < character.resolvedImages.size(); ++page)
+            addSprite(character.resolvedImages[page], page < character.resolvedAtlases.size() ? character.resolvedAtlases[page] : "");
     } else {
         const auto& stage = std::get<UniversalStage>(asset->parsed);
         for (const StageObject& object : stage.objects)
@@ -1825,19 +2013,28 @@ void copyVisualAsset(const Vfs& vfs, const std::string& source, const fs::path& 
         missing.push_back(source);
 }
 
+std::vector<std::string> animatePagePaths(const Vfs& vfs, const std::string& atlas) {
+    std::vector<std::string> result;
+    if (!AtlasStore::isAnimatePath(atlas)) return result;
+    const std::string folder = lower(Vfs::normalize(fs::u8path(atlas).parent_path().u8string()));
+    for (const Vfs::Entry& entry : vfs.allEntries()) {
+        if (lower(Vfs::normalize(fs::u8path(entry.virtualPath).parent_path().u8string())) != folder) continue;
+        const std::string name = lower(fs::u8path(entry.virtualPath).filename().u8string());
+        const std::string extension = lower(fs::u8path(entry.virtualPath).extension().u8string());
+        if (name.rfind("spritemap", 0) == 0 &&
+            (extension == ".png" || extension == ".json"))
+            result.push_back(entry.virtualPath);
+    }
+    return result;
+}
+
 void copyAtlasSet(const Vfs& vfs, const std::string& image, const std::string& atlas,
                   const fs::path& package, std::set<std::string>& copied,
                   std::vector<std::string>& missing) {
     copyVisualAsset(vfs, image, package, copied, missing);
     copyVisualAsset(vfs, atlas, package, copied, missing);
-    if (!AtlasStore::isAnimatePath(atlas)) return;
-    const std::string folder = lower(Vfs::normalize(fs::u8path(atlas).parent_path().u8string()));
-    for (const Vfs::Entry& entry : vfs.allEntries()) {
-        if (lower(Vfs::normalize(fs::u8path(entry.virtualPath).parent_path().u8string())) != folder) continue;
-        const std::string name = lower(fs::u8path(entry.virtualPath).filename().u8string());
-        if (name.rfind("spritemap", 0) == 0)
-            copyVisualAsset(vfs, entry.virtualPath, package, copied, missing);
-    }
+    for (const std::string& path : animatePagePaths(vfs, atlas))
+        copyVisualAsset(vfs, path, package, copied, missing);
 }
 
 std::string removePsychImportBanner(std::string value) {
@@ -1847,21 +2044,11 @@ std::string removePsychImportBanner(std::string value) {
     return value;
 }
 
-std::string luaQuoted(const std::string& value) {
-    std::string result = "'";
-    for (char c : value) {
-        if (c == '\\' || c == '\'') result.push_back('\\');
-        if (c == '\n') result += "\\n";
-        else if (c == '\r') result += "\\r";
-        else result.push_back(c);
-    }
-    result.push_back('\'');
-    return result;
-}
 
 std::string verifyExportedResource(const fs::path& package,
                                    const ModExplorerAsset& source,
-                                   const std::string& exportedId) {
+                                   const std::string& exportedId,
+                                   const AnimateSparrowConversion* convertedCharacter = nullptr) {
     ModExplorerCatalog checked;
     if (!checked.scan(package)) return checked.error();
     for (const ModExplorerAsset& result : checked.assets()) {
@@ -1870,7 +2057,20 @@ std::string verifyExportedResource(const fs::path& package,
         if (source.kind == ModExplorerAsset::Kind::Character) {
             const UniversalCharacter& character = std::get<UniversalCharacter>(result.parsed);
             if (character.resolvedImage.empty()) return "Exported character image could not be resolved";
+            if (character.resolvedAtlas.empty()) return "Exported character atlas could not be resolved";
             if (character.anims.empty()) return "Exported character has no playable animations";
+            const UniversalCharacter& authored = std::get<UniversalCharacter>(source.parsed);
+            for (const AnimationDef& animation : authored.anims) {
+                if (animation.resolvedFrames <= 0) continue;
+                const auto found = std::find_if(character.anims.begin(), character.anims.end(),
+                    [&](const AnimationDef& candidate) { return candidate.name == animation.name; });
+                if (found == character.anims.end() ||
+                    (!convertedCharacter && found->resolvedFrames <= 0))
+                    return "Exported animation has no playable frames: " + animation.name;
+                if (convertedCharacter && convertedCharacter->sheets.size() == 1 &&
+                    found->resolvedFrames != animation.resolvedFrames)
+                    return "Exported animation frame count differs: " + animation.name;
+            }
         } else {
             const UniversalStage& authored = std::get<UniversalStage>(source.parsed);
             const UniversalStage& stage = std::get<UniversalStage>(result.parsed);
@@ -1890,11 +2090,162 @@ std::string verifyExportedResource(const fs::path& package,
     return "Exported definition was not found in the package";
 }
 
+std::string unsupportedVSliceAtlases(const ModExplorerAsset& asset, const Vfs& vfs) {
+    if (asset.kind != ModExplorerAsset::Kind::Character ||
+        asset.format != ModExplorerAsset::Format::VSliceJson) return {};
+    const auto& character = std::get<UniversalCharacter>(asset.parsed);
+    const std::string source = !character.sourceText.empty() ? character.sourceText :
+        vfs.readText(asset.sourcePath).value_or(std::string());
+    const json authored = json::parse(source, nullptr, false);
+    if (!authored.is_object()) return "V-Slice source JSON could not be inspected";
+    const std::string renderType = lower(authored.value("renderType", std::string()));
+    if (renderType.rfind("multi", 0) == 0)
+        return "V-Slice multi-atlas characters need every animation assetPath preserved";
+    const std::string base = authored.value("assetPath", std::string());
+    if (authored.contains("animations") && authored["animations"].is_array())
+        for (const json& animation : authored["animations"])
+            if (animation.is_object() && animation.contains("assetPath") &&
+                animation["assetPath"].is_string() &&
+                animation["assetPath"].get<std::string>() != base)
+                return "V-Slice animation uses a separate assetPath";
+    return {};
+}
+
+using PsychSparrowConversion = AnimateSparrowConversion;
+
+std::string writeSparrowConversion(const fs::path& directory,
+                                   AnimateSparrowConversion& converted) {
+    if (!converted.error.empty()) return converted.error;
+    if (converted.sheets.empty() || converted.sheets.size() != converted.sheetNames.size())
+        return "Sparrow conversion contains no complete pages";
+    std::error_code ec;
+    fs::create_directories(directory, ec);
+    if (ec) return ec.message();
+    std::vector<int> counts(converted.prefixes.size(), 0);
+    std::set<std::string> names;
+    for (size_t page = 0; page < converted.sheets.size(); ++page) {
+        MountedSheet& sheet = converted.sheets[page];
+        const fs::path pngPath = directory / fs::u8path(converted.sheetNames[page] + ".png");
+        const fs::path xmlPath = directory / fs::u8path(converted.sheetNames[page] + ".xml");
+        pugi::xml_document document;
+        if (!document.load_string(sheet.xml.c_str())) return "Generated Sparrow XML did not parse";
+        const auto root = document.child("TextureAtlas");
+        if (std::string(root.attribute("imagePath").value()) != pngPath.filename().u8string())
+            return "Sparrow XML references the wrong image";
+        for (const auto node : root.children("SubTexture")) {
+            const std::string name = node.attribute("name").value();
+            const int x = node.attribute("x").as_int(-1), y = node.attribute("y").as_int(-1);
+            const int w = node.attribute("width").as_int(), h = node.attribute("height").as_int();
+            const int fw = node.attribute("frameWidth").as_int(), fh = node.attribute("frameHeight").as_int();
+            const int trimX = -node.attribute("frameX").as_int(), trimY = -node.attribute("frameY").as_int();
+            if (!names.insert(name).second || x < 0 || y < 0 || w <= 0 || h <= 0 ||
+                w > sheet.png.width || h > sheet.png.height ||
+                x > sheet.png.width - w || y > sheet.png.height - h ||
+                trimX < 0 || trimY < 0 || fw < w || fh < h ||
+                trimX > fw - w || trimY > fh - h)
+                return "Invalid or duplicate Sparrow frame: " + name;
+            size_t animation = 0;
+            for (; animation < converted.prefixes.size(); ++animation)
+                if (name.rfind(converted.prefixes[animation], 0) == 0) break;
+            if (animation == converted.prefixes.size()) return "Unknown Sparrow frame prefix";
+            ++counts[animation];
+        }
+        const GifWriteResult written = writeMountedPng(pngPath, sheet.png, 0);
+        if (!written.ok) return written.error;
+        if (!writeText(xmlPath, sheet.xml)) return "Could not write Sparrow XML";
+        std::ifstream png(pngPath, std::ios::binary);
+        std::array<std::uint8_t, 33> header{};
+        png.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+        int width = 0, height = 0, channels = 0;
+        if (png.gcount() != static_cast<std::streamsize>(header.size()) ||
+            !stbi_info_from_memory(header.data(), static_cast<int>(header.size()), &width, &height, &channels) ||
+            width != sheet.png.width || height != sheet.png.height)
+            return "Written Sparrow PNG has invalid dimensions";
+        std::ifstream xml(xmlPath, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(xml)), std::istreambuf_iterator<char>());
+        if (!xml || text != sheet.xml) return "Written Sparrow XML differs from the generated atlas";
+        sheet.png.frames.clear();
+    }
+    if (counts != converted.frameCounts) return "Sparrow pages lost animation frames";
+    return {};
+}
+
+std::string sparrowImageList(const AnimateSparrowConversion& converted,
+                              const std::string& folder) {
+    std::string result;
+    for (const std::string& name : converted.sheetNames) {
+        if (!result.empty()) result += ",";
+        result += folder + "/" + name;
+    }
+    return result;
+}
+
+PsychSparrowConversion convertAnimateToPsychSparrow(
+    AtlasApp&, const Vfs& vfs, const std::string& image,
+    const std::string& atlasPath, const std::vector<AnimationDef>& animations,
+    const std::string& outputName, bool flipX, bool flipY = false) {
+    return prepareAnimateSparrow(vfs, image, atlasPath, animations, outputName, flipX, flipY);
+}
+
 bool exportEngine(AtlasApp& app, const fs::path& folder, bool psych) {
     const ModExplorerAsset* asset = selectedAsset(app);
     if (!asset || !asset->valid || app.selectedMod < 0) return false;
     const LoadedMod& mod = *app.mods[static_cast<size_t>(app.selectedMod)];
     const Vfs& vfs = mod.catalog.vfs();
+    const std::string unsupportedAtlas = unsupportedVSliceAtlases(*asset, vfs);
+    if (!psych && asset->kind == ModExplorerAsset::Kind::Character && std::get<UniversalCharacter>(asset->parsed).resolvedImages.size() > 1) {
+        setStatus(app, "Codename: la conversión de varias hojas Sparrow aún no es compatible. Usa los originales o Psych.", "Codename: separate Sparrow pages cannot yet be converted. Use Original files or Psych.");
+        return false;
+    }
+    if (!unsupportedAtlas.empty()) {
+        setStatus(app, "Exportación detenida: " + unsupportedAtlas,
+                       "Export stopped: " + unsupportedAtlas);
+        return false;
+    }
+    std::unique_ptr<PsychSparrowConversion> characterSparrow;
+    std::vector<std::unique_ptr<PsychSparrowConversion>> stageSparrow;
+    if (psych) {
+        if (asset->kind == ModExplorerAsset::Kind::Character &&
+            AtlasStore::isAnimatePath(std::get<UniversalCharacter>(asset->parsed).resolvedAtlas)) {
+            const UniversalCharacter& character = std::get<UniversalCharacter>(asset->parsed);
+            characterSparrow = std::make_unique<PsychSparrowConversion>(
+                convertAnimateToPsychSparrow(app, vfs, character.resolvedImage,
+                    character.resolvedAtlas, character.anims, safeName(asset->id), false));
+            if (!characterSparrow->error.empty()) {
+                setStatus(app, "No se pudo convertir Animate a Sparrow: " + characterSparrow->error,
+                               "Animate-to-Sparrow conversion failed: " + characterSparrow->error);
+                return false;
+            }
+        }
+        if (asset->kind == ModExplorerAsset::Kind::Stage) {
+            const UniversalStage& stage = std::get<UniversalStage>(asset->parsed);
+            stageSparrow.resize(stage.objects.size());
+            size_t stageBytes = 0;
+            for (size_t index = 0; index < stage.objects.size(); ++index) {
+                const StageObject& object = stage.objects[index];
+                if (object.kind == StageObject::Kind::Sprite && AtlasStore::isAnimatePath(object.resolvedAtlas)) {
+                    const auto flipY = object.unknownAttributes.find("flipY");
+                    stageSparrow[index] = std::make_unique<PsychSparrowConversion>(
+                        convertAnimateToPsychSparrow(app, vfs, object.resolvedImage,
+                            object.resolvedAtlas, object.anims, "layer-" + std::to_string(index + 1),
+                            object.flipX, flipY != object.unknownAttributes.end() &&
+                                (flipY->second == "true" || flipY->second == "1")));
+                    if (!stageSparrow[index]->error.empty()) {
+                        setStatus(app, "No se pudo convertir la capa Animate " + object.name + ": " + stageSparrow[index]->error,
+                            "Animate layer conversion failed for " + object.name + ": " + stageSparrow[index]->error);
+                        return false;
+                    }
+                    for (const auto& sheet : stageSparrow[index]->sheets)
+                        stageBytes += static_cast<size_t>(sheet.png.width) * sheet.png.height * 4;
+                    if (stageBytes > 384u * 1024u * 1024u) {
+                        setStatus(app, "Las capas Animate juntas superan 384 MB; no se exportó el escenario.",
+                            "Combined Animate layers exceed 384 MB; the stage was not exported.");
+                        return false;
+                    }
+                }
+            }
+        }
+    }
     const std::string id = safeName(asset->id);
     const std::string modId = safeName(mod.label) + "-atlas";
     const fs::path output = availablePath(folder / fs::u8path(id + (psych ? "-psych" : "-codename")), true);
@@ -1909,6 +2260,15 @@ bool exportEngine(AtlasApp& app, const fs::path& folder, bool psych) {
     std::set<std::string> copied;
     std::vector<std::string> missing;
     std::vector<std::string> notes;
+    if (psych) {
+        json pack;
+        pack["name"] = asset->id + " (Funkin Atlas)";
+        pack["description"] = "Visual/decorative export; scripts and mechanics are not translated.";
+        pack["restart"] = false;
+        pack["color"] = {170, 120, 80};
+        if (!writeText(package / "pack.json", pack.dump(2)))
+            missing.push_back("pack.json");
+    }
     bool definitionWritten = false;
     const bool native = psych
         ? asset->format == ModExplorerAsset::Format::PsychJson ||
@@ -1916,14 +2276,15 @@ bool exportEngine(AtlasApp& app, const fs::path& folder, bool psych) {
         : asset->format == ModExplorerAsset::Format::CodenameXml;
     if (asset->kind == ModExplorerAsset::Kind::Character) {
         const UniversalCharacter& original = std::get<UniversalCharacter>(asset->parsed);
-        std::string spriteKey = AtlasStore::isAnimatePath(original.resolvedAtlas)
+        std::string spriteKey = characterSparrow ? sparrowImageList(*characterSparrow, "characters") :
+            AtlasStore::isAnimatePath(original.resolvedAtlas)
             ? imageKey(fs::u8path(original.resolvedAtlas).parent_path().u8string())
             : imageKey(original.resolvedImage);
         if (spriteKey.empty()) spriteKey = original.spriteAtlas;
         const fs::path definition = package /
             (psych ? fs::path("characters") : fs::path("data/characters")) /
             fs::u8path(id + (psych ? ".json" : ".xml"));
-        if (native && vfs.exists(asset->sourcePath))
+        if (native && !characterSparrow && vfs.exists(asset->sourcePath))
             definitionWritten = copyToPackage(vfs, asset->sourcePath, definition);
         else if (psych) {
             json source;
@@ -1936,13 +2297,42 @@ bool exportEngine(AtlasApp& app, const fs::path& folder, bool psych) {
             source["flip_x"] = original.flipX;
             source["no_antialiasing"] = !original.antialiasing;
             source["animations"] = json::array();
-            for (const AnimationDef& animation : original.anims)
+            for (size_t index = 0; index < original.anims.size(); ++index) {
+                const AnimationDef& animation = original.anims[index];
                 source["animations"].push_back({
-                    {"anim", animation.name}, {"name", animation.atlasPrefix},
+                    {"anim", animation.name}, {"name", characterSparrow ? characterSparrow->prefixes[index] : animation.atlasPrefix},
                     {"fps", animation.fps}, {"loop", animation.loop},
-                    {"indices", animation.indices},
-                    {"offsets", {animation.offset.x, animation.offset.y}}
+                    {"indices", characterSparrow ? std::vector<int>{} : animation.indices},
+                    {"offsets", characterSparrow ?
+                        json::array({-characterSparrow->originX,
+                                     -characterSparrow->originY}) :
+                        json::array({animation.offset.x, animation.offset.y})}
                 });
+            }
+            const bool hasIdle = std::any_of(original.anims.begin(), original.anims.end(),
+                [](const AnimationDef& animation) { return animation.name == "idle"; });
+            const bool hasDanceLeft = std::any_of(original.anims.begin(), original.anims.end(),
+                [](const AnimationDef& animation) { return animation.name == "danceLeft"; });
+            const bool hasDanceRight = std::any_of(original.anims.begin(), original.anims.end(),
+                [](const AnimationDef& animation) { return animation.name == "danceRight"; });
+            if (characterSparrow && !original.anims.empty() && !hasIdle &&
+                !(hasDanceLeft && hasDanceRight)) {
+                size_t fallback = 0;
+                for (size_t index = 0; index < original.anims.size(); ++index)
+                    if (lower(original.anims[index].name).rfind("idle", 0) == 0) {
+                        fallback = index;
+                        break;
+                    }
+                source["animations"].push_back({
+                    {"anim", "idle"}, {"name", characterSparrow->prefixes[fallback]},
+                    {"fps", original.anims[fallback].fps}, {"loop", true},
+                    {"indices", json::array()},
+                    {"offsets", {-characterSparrow->originX,
+                                  -characterSparrow->originY}}
+                });
+                notes.push_back("Added a Psych idle fallback using " +
+                    original.anims[fallback].name + ".");
+            }
             if (original.healthColor.size() == 7 && original.healthColor[0] == '#') {
                 try {
                     source["healthbar_colors"] = {
@@ -1959,7 +2349,21 @@ bool exportEngine(AtlasApp& app, const fs::path& folder, bool psych) {
             definitionWritten = writeText(definition, removePsychImportBanner(
                 emitCodenameCharacter(character, {})));
         }
-        copyAtlasSet(vfs, original.resolvedImage, original.resolvedAtlas, package, copied, missing);
+        if (characterSparrow) {
+            const std::string error = writeSparrowConversion(package / "images" / "characters", *characterSparrow);
+            if (!error.empty()) {
+                setStatus(app, "Paquete Sparrow incompleto: " + error, "Incomplete Sparrow package: " + error);
+                return false;
+            }
+            notes.push_back("Adobe Animate poses were baked into " +
+                std::to_string(characterSparrow->sheets.size()) + " Sparrow PNG/XML page(s).");
+            if (characterSparrow->sheets.size() > 1)
+                notes.push_back("MULTI-ATLAS CHARACTER: requires Psych Engine 1.x with Paths.getMultiAtlas (comma-separated image keys). Psych 0.7.x is not compatible. Atlas preview currently displays the first output page only.");
+        } else {
+            copyAtlasSet(vfs, original.resolvedImage, original.resolvedAtlas, package, copied, missing);
+            for (size_t page = 0; page < original.resolvedImages.size(); ++page)
+                copyAtlasSet(vfs, original.resolvedImages[page], page < original.resolvedAtlases.size() ? original.resolvedAtlases[page] : "", package, copied, missing);
+        }
         if (!original.icon.empty()) {
             const std::string found = resolveCharacterIcon(vfs, asset->sourcePath, original.icon);
             std::string iconId = fs::u8path(original.icon).stem().u8string();
@@ -2011,104 +2415,38 @@ bool exportEngine(AtlasApp& app, const fs::path& folder, bool psych) {
             definitionWritten = writeText(definition,
                 removePsychImportBanner(emitCodenameStage(converted)));
         }
-        for (const StageObject& object : stage.objects) {
-            copyAtlasSet(vfs, object.resolvedImage, object.resolvedAtlas, package, copied, missing);
+        std::vector<const AnimateSparrowConversion*> mounted(stage.objects.size(), nullptr);
+        std::vector<std::string> spriteKeys(stage.objects.size());
+        for (size_t index = 0; index < stage.objects.size(); ++index) {
+            const StageObject& object = stage.objects[index];
+            spriteKeys[index] = !object.resolvedImage.empty()
+                ? imageKey(object.resolvedImage) : object.spritePath;
+            if (index < stageSparrow.size() && stageSparrow[index]) {
+                mounted[index] = stageSparrow[index].get();
+                spriteKeys[index] = "stages/" + id + "-atlas";
+                const std::string error = writeSparrowConversion(
+                    package / "images" / fs::u8path(spriteKeys[index]), *stageSparrow[index]);
+                if (!error.empty()) {
+                    setStatus(app, "Capa Sparrow incompleta: " + object.name + ": " + error,
+                        "Incomplete Sparrow layer: " + object.name + ": " + error);
+                    return false;
+                }
+                notes.push_back("Mounted Animate layer " + object.name + ": " +
+                    std::to_string(stageSparrow[index]->sheets.size()) + " page(s).");
+            } else
+                copyAtlasSet(vfs, object.resolvedImage, object.resolvedAtlas, package, copied, missing);
             if (!object.spritePath.empty() && object.resolvedImage.empty()) {
                 notes.push_back("Unresolved stage sprite: " + object.spritePath);
                 missing.push_back("stage sprite: " + object.spritePath);
             }
         }
-        if (native) {
-            fs::path sibling = fs::u8path(asset->sourcePath);
-            for (const char* extension : {".lua", ".hx"}) {
-                sibling.replace_extension(extension);
-                if (!vfs.exists(sibling.u8string())) continue;
-                const fs::path target = package /
-                    (psych ? fs::path("stages") : fs::path("data/stages")) /
-                    fs::u8path(id + extension);
-                if (!copyToPackage(vfs, sibling.u8string(), target))
-                    missing.push_back(sibling.u8string());
-            }
-        } else if (psych) {
-            std::string script = "function onCreate()\n";
-            bool front = false;
-            for (const StageObject& object : stage.objects) {
-                if (object.kind == StageObject::Kind::Player ||
-                    object.kind == StageObject::Kind::Opponent ||
-                    object.kind == StageObject::Kind::Girlfriend) {
-                    front = true;
-                    continue;
-                }
-                if (object.kind != StageObject::Kind::Sprite &&
-                    object.kind != StageObject::Kind::Box) continue;
-                const std::string tag = object.name.empty() ? "object" : object.name;
-                const std::string spriteKey = !object.resolvedImage.empty()
-                    ? imageKey(object.resolvedImage) : object.spritePath;
-                const bool animated = !object.anims.empty();
-                script += "  " + std::string(animated ? "makeAnimatedLuaSprite(" : "makeLuaSprite(") +
-                    luaQuoted(tag) + ", " + (spriteKey.empty() ? "nil" : luaQuoted(spriteKey)) +
-                    ", " + std::to_string(object.position.x) + ", " +
-                    std::to_string(object.position.y) + ")\n";
-                if (object.kind == StageObject::Kind::Box)
-                    script += "  makeGraphic(" + luaQuoted(tag) + ", " +
-                        std::to_string(static_cast<int>(object.width)) + ", " +
-                        std::to_string(static_cast<int>(object.height)) + ", " +
-                        luaQuoted(object.color.empty() ? "FFFFFF" : object.color) + ")\n";
-                for (const AnimationDef& animation : object.anims)
-                    script += "  addAnimationByPrefix(" + luaQuoted(tag) + ", " +
-                        luaQuoted(animation.name) + ", " + luaQuoted(animation.atlasPrefix) +
-                        ", " + std::to_string(animation.fps) + ", " +
-                        (animation.loop ? "true" : "false") + ")\n";
-                if (object.scale.x != 1.0f || object.scale.y != 1.0f)
-                    script += "  scaleObject(" + luaQuoted(tag) + ", " +
-                        std::to_string(object.scale.x) + ", " +
-                        std::to_string(object.scale.y) + ")\n";
-                if (object.scroll.x != 1.0f || object.scroll.y != 1.0f)
-                    script += "  setScrollFactor(" + luaQuoted(tag) + ", " +
-                        std::to_string(object.scroll.x) + ", " +
-                        std::to_string(object.scroll.y) + ")\n";
-                if (object.alpha != 1.0f)
-                    script += "  setProperty(" + luaQuoted(tag + ".alpha") + ", " +
-                        std::to_string(object.alpha) + ")\n";
-                script += "  addLuaSprite(" + luaQuoted(tag) + ", " +
-                    (front ? "true" : "false") + ")\n";
-            }
-            script += "end\n";
-            bool hasBeat = false;
-            for (const StageObject& object : stage.objects)
-                if ((object.type == "beat" || object.type == "onbeat") && !object.anims.empty())
-                    hasBeat = true;
-            if (hasBeat) {
-                script += "\nfunction onBeatHit()\n";
-                for (const StageObject& object : stage.objects) {
-                    if ((object.type != "beat" && object.type != "onbeat") ||
-                        object.anims.empty()) continue;
-                    const int interval = std::max(1, object.beatInterval);
-                    const int remainder = ((-object.beatOffset % interval) + interval) % interval;
-                    script += "  if curBeat % " + std::to_string(interval) + " == " +
-                        std::to_string(remainder) + " then objectPlayAnimation(" +
-                        luaQuoted(object.name) + ", " +
-                        luaQuoted(object.anims.front().name) + ", true) end\n";
-                    if (object.anims.size() > 1)
-                        notes.push_back("Beat animation sequence needs manual review: " + object.name);
-                }
-                script += "end\n";
-            }
+        if (psych) {
+            const std::string script = emitPsychVisualStage(stage, mounted, spriteKeys);
             if (!writeText(package / "stages" / fs::u8path(id + ".lua"), script))
                 missing.push_back(id + ".lua");
-            notes.push_back("Generated static Psych stage script; dynamic behavior needs manual porting.");
-        } else {
+            notes.push_back("Generated visual-only Psych stage loader. Animate page switching, FPS, loops and declared beat animations are reproduced; original scripts and mechanics are not ported.");
+        } else if (!native) {
             notes.push_back("Generated static Codename stage XML; runtime Lua behavior needs manual porting.");
-        }
-    }
-    if (!native) {
-        fs::path sibling = fs::u8path(asset->sourcePath);
-        for (const char* extension : {".lua", ".hx"}) {
-            sibling.replace_extension(extension);
-            if (!vfs.exists(sibling.u8string())) continue;
-            if (!copyToPackage(vfs, sibling.u8string(),
-                               package / "source-scripts" / fs::u8path(id + extension)))
-                missing.push_back(sibling.u8string());
         }
     }
     std::string guide = "Funkin Atlas export\nVISUAL/DECORATIVE CONTENT ONLY. Cross-engine scripts, cutscenes and mechanics are not translated.\n"
@@ -2127,7 +2465,8 @@ bool exportEngine(AtlasApp& app, const fs::path& folder, bool psych) {
                   "Could not write the definition; check " + output.u8string());
         return false;
     }
-    const std::string verification = verifyExportedResource(output, *asset, id);
+    const std::string verification = verifyExportedResource(output, *asset, id,
+        characterSparrow.get());
     if (!verification.empty()) {
         setStatus(app, "Exportación incompleta (se conserva en disco): " + verification + " · " + output.u8string(),
                        "Incomplete export (kept on disk): " + verification + " · " + output.u8string());
@@ -2142,6 +2481,12 @@ bool exportVSlice(AtlasApp& app, const fs::path& folder) {
     const ModExplorerAsset* asset = selectedAsset(app);
     if (!asset || !asset->valid) return false;
     const LoadedMod& mod = *app.mods[static_cast<size_t>(app.selectedMod)];
+    const std::string unsupportedAtlas = unsupportedVSliceAtlases(*asset, mod.catalog.vfs());
+    if (!unsupportedAtlas.empty()) {
+        setStatus(app, "Exportación detenida: " + unsupportedAtlas,
+                       "Export stopped: " + unsupportedAtlas);
+        return false;
+    }
     DiagnosticSink sink(DiagnosticScope::WorkspaceInventory);
     Result<VSliceCharacterPackage> built = Result<VSliceCharacterPackage>::fail("unsupported");
     if (asset->kind == ModExplorerAsset::Kind::Character) {
@@ -2152,6 +2497,23 @@ bool exportVSlice(AtlasApp& app, const fs::path& folder) {
         source.modId = safeName(mod.label) + "-atlas";
         source.imageVirtualPath = character.resolvedImage;
         source.atlasVirtualPath = character.resolvedAtlas;
+        if (AtlasStore::isAnimatePath(character.resolvedAtlas)) {
+            source.animatePageVirtualPaths = animatePagePaths(mod.catalog.vfs(), character.resolvedAtlas);
+            fs::path jsonPath = fs::u8path(character.resolvedImage);
+            jsonPath.replace_extension(".json");
+            if (mod.catalog.vfs().exists(Vfs::normalize(jsonPath.u8string())))
+                source.spritemapJsonVirtualPath = Vfs::normalize(jsonPath.u8string());
+            else {
+                const std::string fallback = Vfs::normalize(
+                    (fs::u8path(character.resolvedAtlas).parent_path() / "spritemap.json").u8string());
+                if (mod.catalog.vfs().exists(fallback)) source.spritemapJsonVirtualPath = fallback;
+            }
+            if (source.spritemapJsonVirtualPath.empty()) {
+                setStatus(app, "Falta el JSON del spritemap de Animate.",
+                               "Animate spritemap JSON is missing.");
+                return false;
+            }
+        }
         source.iconVirtualPath = resolveCharacterIcon(mod.catalog.vfs(), asset->sourcePath,
             character.icon.empty() ? character.id : character.icon);
         built = buildVSliceCharacterPackage(source, sink);
@@ -2164,6 +2526,8 @@ bool exportVSlice(AtlasApp& app, const fs::path& folder) {
         for (const StageObject& object : stage.objects) {
             source.objectImagePaths.push_back(object.resolvedImage);
             source.objectAtlasPaths.push_back(object.resolvedAtlas);
+            source.objectAnimatePagePaths.push_back(
+                animatePagePaths(mod.catalog.vfs(), object.resolvedAtlas));
         }
         built = buildVSliceStagePackage(source, sink);
     }
@@ -2177,6 +2541,13 @@ bool exportVSlice(AtlasApp& app, const fs::path& folder) {
                   "Solo contenido visual/decorativo. No se traducen scripts, cinemáticas ni mecánicas a V-Slice.\n";
     limits.role = VSliceFileRole::Report;
     built.value().files.push_back(std::move(limits));
+    std::error_code directoryError;
+    fs::create_directories(folder, directoryError);
+    if (directoryError) {
+        setStatus(app, "No se pudo crear la carpeta de exportación V-Slice.",
+                       "Could not create the V-Slice export folder.");
+        return false;
+    }
     const fs::path path = availablePath(folder / fs::u8path(safeName(asset->id) + "-vslice.zip"), false);
     std::string error;
     fs::path written;
@@ -2201,25 +2572,10 @@ bool exportStageObjectGifFallback(AtlasApp& app, const StageObject& object,
 
 GifPrepareResult prepareStageObjectGif(AtlasApp& app, const StageObject& object,
                                       const AnimationDef& animation) {
-    GifPrepareResult result;
-    if (object.resolvedImage.empty()) {
-        result.error = "No resolved stage image";
-        return result;
-    }
     const Vfs& vfs = app.mods[static_cast<size_t>(app.selectedMod)]->catalog.vfs();
-    const auto image = vfs.readBytes(object.resolvedImage, 128u * 1024u * 1024u);
-    if (!image) {
-        result.error = "Could not read stage image";
-        return result;
-    }
-    const SparrowAtlas* sparrow = nullptr;
-    const AnimateAtlas* animate = nullptr;
-    if (AtlasStore::isAnimatePath(object.resolvedAtlas))
-        animate = app.atlases.getAnimate(object.resolvedAtlas);
-    else
-        sparrow = app.atlases.get(object.resolvedAtlas);
-    return prepareMountedAnimationGif(*image, animation, sparrow, animate,
-                                      object.flipX, false, animation.loop);
+    StageObject selected = object;
+    selected.anims = {animation};
+    return prepareStageAssetAnimation(inspectStageAsset(vfs, selected), 0, true);
 }
 
 void drawStageAnimationPanel(AtlasApp& app, const LoadedMod& mod,
@@ -2513,7 +2869,9 @@ bool exportStageZip(AtlasApp& app, const fs::path& folder) {
     entries["README.txt"] = std::vector<unsigned char>(guide.begin(), guide.end());
     const fs::path target = availablePath(folder / fs::u8path(safeName(asset->id) + "-stage-assets.zip"), false);
     if (target.empty()) return false;
-    const fs::path temporary = availablePath(fs::path(target.u8string() + ".tmp"), false);
+    fs::path temporaryBase = target;
+    temporaryBase += fs::u8path(".tmp");
+    const fs::path temporary = availablePath(temporaryBase, false);
     if (temporary.empty()) return false;
     mz_zip_archive zip{};
     if (!mz_zip_writer_init_file(&zip, temporary.u8string().c_str(), 0)) {
@@ -2544,12 +2902,27 @@ bool exportStageZip(AtlasApp& app, const fs::path& folder) {
     return true;
 }
 
+SDL_WindowID atlasCurrentWindowId() {
+    const ImGuiViewport* viewport = ImGui::GetWindowViewport();
+    return viewport && viewport->PlatformHandle
+        ? static_cast<SDL_WindowID>(reinterpret_cast<std::intptr_t>(viewport->PlatformHandle))
+        : 0;
+}
+
 #include "CharacterTools.hpp"
+#include "ExportTools.hpp"
 
 bool exportStageScenePng(AtlasApp& app, const fs::path& folder);
 bool exportStageSceneGif(AtlasApp& app, const fs::path& folder);
+bool exportAdvancedStageAsset(AtlasApp& app, DialogAction action, const fs::path& folder);
 bool exportCharacterPreviewGif(AtlasApp& app, const fs::path& folder);
 
+void processDialogResult(AtlasApp& app, const std::string& path, DialogAction action);
+
+// Lo que sigue a un dialogo (exportar, anadir un mod) toca disco y datos de
+// mods de terceros. Una excepcion que escapaba -`json::dump` con un nombre que
+// no es UTF-8, un filesystem_error, memoria- cerraba Atlas sin guardar nada.
+// Ahora se dice en la barra de estado y la aplicacion sigue.
 void processDialog(AtlasApp& app) {
     std::string path;
     DialogAction action;
@@ -2562,6 +2935,20 @@ void processDialog(AtlasApp& app) {
         app.dialogAction = DialogAction::None;
     }
     if (path.empty()) return;
+    try {
+        processDialogResult(app, path, action);
+    } catch (const std::exception& error) {
+        const std::string detail = ensureUtf8(error.what());
+        setStatus(app, "La operación falló (Atlas sigue abierto): " + detail,
+                       "The operation failed (Atlas is still open): " + detail);
+    } catch (...) {
+        setStatus(app, "La operación falló (Atlas sigue abierto).",
+                       "The operation failed (Atlas is still open).");
+    }
+}
+
+void processDialogResult(AtlasApp& app, const std::string& path, DialogAction action) {
+    if (action == DialogAction::BatchExport) { beginExportQueue(app, fs::u8path(path)); return; }
     if (action == DialogAction::PairGifs) {
         if (app.secondaryAssetIndex < 0) return;
         const bool first = exportCharacterAnimation(app, DialogAction::AnimationGif,
@@ -2585,6 +2972,12 @@ void processDialog(AtlasApp& app) {
         exportCharacterAnimation(app, action, fs::u8path(path));
         return;
     }
+    if (action == DialogAction::AssetPosePng || action == DialogAction::AssetAnimationGif ||
+        action == DialogAction::AssetMountedSheet || action == DialogAction::AssetSourceZip ||
+        action == DialogAction::AssetBlockPng || action == DialogAction::AssetAnimationBatch) {
+        exportAdvancedStageAsset(app, action, fs::u8path(path));
+        return;
+    }
     if (action == DialogAction::StageGif || action == DialogAction::StageSheet ||
         action == DialogAction::StageZip || action == DialogAction::StageObjectPng ||
         action == DialogAction::StageScenePng || action == DialogAction::StageSceneGif) {
@@ -2597,9 +2990,7 @@ void processDialog(AtlasApp& app) {
         return;
     }
     if (action == DialogAction::Export) {
-        if (app.exportTarget == 0) exportOriginal(app, fs::u8path(path));
-        else if (app.exportTarget == 1) exportVSlice(app, fs::u8path(path));
-        else exportEngine(app, fs::u8path(path), app.exportTarget == 2);
+        exportReference(app, app.exportReview.source, app.exportReview.target, fs::u8path(path));
         return;
     }
     if (action == DialogAction::AddSingle) {
@@ -2678,11 +3069,15 @@ CharacterBinding previewBinding(AtlasApp& app) {
 
 #include "SongLab.hpp"
 
-ViewportTransform frameScene(const RenderList& list, bool character,
-                             int width = 960, int height = 540) {
-    ViewportTransform view;
-    float left = 0, top = 0, right = 0, bottom = 0;
+struct SceneBounds {
+    float left = 0.0f;
+    float top = 0.0f;
+    float right = 0.0f;
+    float bottom = 0.0f;
     bool any = false;
+};
+
+void includeSceneBounds(const RenderList& list, SceneBounds& bounds) {
     const float centerX = kGameWidth * 0.5f;
     const float centerY = kGameHeight * 0.5f;
     for (const DrawCmd& cmd : list.cmds) {
@@ -2704,22 +3099,46 @@ ViewportTransform frameScene(const RenderList& list, bool character,
                 y = dx * std::sin(angle) + dy * std::cos(angle) + centerY;
             }
             if (!std::isfinite(x) || !std::isfinite(y)) continue;
-            if (!any) { left = right = x; top = bottom = y; any = true; }
-            else { left = std::min(left, x); right = std::max(right, x);
-                   top = std::min(top, y); bottom = std::max(bottom, y); }
+            if (!bounds.any) {
+                bounds.left = bounds.right = x;
+                bounds.top = bounds.bottom = y;
+                bounds.any = true;
+            } else {
+                bounds.left = std::min(bounds.left, x);
+                bounds.right = std::max(bounds.right, x);
+                bounds.top = std::min(bounds.top, y);
+                bounds.bottom = std::max(bounds.bottom, y);
+            }
         }
     }
-    if (!any) return view;
+}
+
+ViewportTransform fitSceneBounds(const SceneBounds& bounds, bool character,
+                                 int width, int height, bool fullScene = false) {
+    ViewportTransform view;
+    if (!bounds.any) return view;
+    const float centerX = kGameWidth * 0.5f;
+    const float centerY = kGameHeight * 0.5f;
     const float baseFit = std::max(0.001f, std::min(
         width / static_cast<float>(kGameWidth),
         height / static_cast<float>(kGameHeight)));
-    view.zoom = std::clamp(std::min(width * 0.9f / baseFit / std::max(1.0f, right - left),
-                                    height * 0.9f / baseFit / std::max(1.0f, bottom - top)),
-                           0.12f, character ? 4.0f : 1.5f);
-    view.panX = (centerX - (left + right) * 0.5f) * baseFit * view.zoom;
-    view.panY = (centerY - (top + bottom) * 0.5f) * baseFit * view.zoom;
+    view.zoom = std::clamp(std::min(width * 0.9f / baseFit /
+                                    std::max(1.0f, bounds.right - bounds.left),
+                                    height * 0.9f / baseFit / std::max(1.0f, bounds.bottom - bounds.top)),
+                           fullScene ? 0.00001f : 0.12f, character ? 4.0f : 1.5f);
+    view.panX = (centerX - (bounds.left + bounds.right) * 0.5f) * baseFit * view.zoom;
+    view.panY = (centerY - (bounds.top + bounds.bottom) * 0.5f) * baseFit * view.zoom;
     return view;
 }
+
+ViewportTransform frameScene(const RenderList& list, bool character,
+                             int width = 960, int height = 540) {
+    SceneBounds bounds;
+    includeSceneBounds(list, bounds);
+    return fitSceneBounds(bounds, character, width, height);
+}
+
+#include "ComparisonViewer.hpp"
 
 ViewportTransform previewView(AtlasApp& app, const RenderList& list,
                               bool character, int width, int height) {
@@ -2803,7 +3222,7 @@ GlRenderer::PreviewImage renderPreview(AtlasApp& app, int width, int height) {
     const bool activeSong = songLabViewActive(app) && app.songLab.audio.playing();
     if (!activeSong ||
         (asset->kind == ModExplorerAsset::Kind::Character && songLabCharacterLine(app) == -1))
-        updateCharacterSequence(app, ImGui::GetIO().DeltaTime * 1000.0f);
+        updateCharacterSequence(app, ImGui::GetIO().DeltaTime * 1000.0f * app.previewSpeed);
     if (asset->kind == ModExplorerAsset::Kind::Character &&
         app.secondaryAssetIndex >= 0 && app.secondaryMarkerIndex >= 0 &&
         (!activeSong || songLabCompanionLine(app) == -1)) {
@@ -2814,7 +3233,7 @@ GlRenderer::PreviewImage renderPreview(AtlasApp& app, int width, int height) {
         std::swap(app.sequenceToken, app.secondarySequenceToken);
         std::swap(app.loopPreview, app.secondaryLoopPreview);
         std::swap(app.manualPreviewOverride, app.secondaryManualPreviewOverride);
-        updateCharacterSequence(app, ImGui::GetIO().DeltaTime * 1000.0f);
+        updateCharacterSequence(app, ImGui::GetIO().DeltaTime * 1000.0f * app.previewSpeed);
         std::swap(app.manualPreviewOverride, app.secondaryManualPreviewOverride);
         std::swap(app.loopPreview, app.secondaryLoopPreview);
         std::swap(app.sequenceToken, app.secondarySequenceToken);
@@ -2859,7 +3278,8 @@ GlRenderer::PreviewImage renderPreview(AtlasApp& app, int width, int height) {
 
 bool renderStageFrame(AtlasApp& app, StageAnimator& animator,
                       const CharacterBinding& binding, int width, int height,
-                      std::vector<unsigned char>& pixels) {
+                      std::vector<unsigned char>& pixels,
+                      const ViewportTransform* fixedView = nullptr) {
     RenderList list;
     buildStageRenderList(app.previewStage, binding, app.atlases,
                          app.renderer, list, &animator);
@@ -2869,7 +3289,7 @@ bool renderStageFrame(AtlasApp& app, StageAnimator& animator,
     glClearColor(0.065f, 0.075f, 0.087f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     const ModExplorerAsset* asset = selectedAsset(app);
-    const ViewportTransform view = previewView(app, list,
+    const ViewportTransform view = fixedView ? *fixedView : previewView(app, list,
         asset && asset->kind == ModExplorerAsset::Kind::Character, width, height);
     app.renderer.draw(list, view, width, height, true, false);
     return app.renderer.endOffscreenFrame(pixels);
@@ -2878,6 +3298,11 @@ bool renderStageFrame(AtlasApp& app, StageAnimator& animator,
 bool exportStageObjectGifFallback(AtlasApp& app, const StageObject& object,
                                   const AnimationDef& animation,
                                   const fs::path& target, const std::string& reason) {
+    if (reason.find("cannot be baked reliably") != std::string::npos) {
+        setStatus(app, "No se exportó una aproximación: " + reason + ". Puedes conservar los archivos visuales originales.",
+                       "No approximation was exported: " + reason + ". Original visual files can be preserved instead.");
+        return false;
+    }
     if (!app.rendererReady || app.selectedStageObject < 0) return false;
     PreparedGifAnimation output;
     output.width = 480;
@@ -2925,12 +3350,39 @@ bool exportStageObjectGifFallback(AtlasApp& app, const StageObject& object,
     return written.ok;
 }
 
+// PNG a una ruta Unicode: stbi_write_png abre con fopen (ANSI) y una carpeta
+// como C:\Users\José\... fallaba. Se codifica en memoria y se escribe con la
+// ruta de verdad.
+bool writePngFile(const fs::path& target, int width, int height, const unsigned char* rgba) {
+    std::string png;
+    const int encoded = stbi_write_png_to_func([](void* context, void* data, int size) {
+        static_cast<std::string*>(context)->append(static_cast<const char*>(data),
+                                                   static_cast<size_t>(size));
+    }, &png, width, height, 4, rgba, width * 4);
+    if (!encoded || png.empty()) return false;
+    // Como el resto de exportaciones: la carpeta de destino puede no existir.
+    std::error_code directoryError;
+    if (target.has_parent_path()) fs::create_directories(target.parent_path(), directoryError);
+    std::ofstream file(target, std::ios::binary | std::ios::trunc);
+    if (!file) return false;
+    file.write(png.data(), static_cast<std::streamsize>(png.size()));
+    return static_cast<bool>(file);
+}
+
 bool exportStageScenePng(AtlasApp& app, const fs::path& folder) {
     const ModExplorerAsset* asset = selectedAsset(app);
     if (!asset || asset->kind != ModExplorerAsset::Kind::Stage || !app.rendererReady) return false;
     std::vector<unsigned char> pixels;
     StageAnimator animator = app.animator;
-    if (!renderStageFrame(app, animator, previewBinding(app), 1280, 720, pixels)) {
+    const CharacterBinding binding = previewBinding(app);
+    RenderList boundsList;
+    buildStageRenderList(app.previewStage, binding, app.atlases,
+                         app.renderer, boundsList, &animator);
+    applyPreviewVisibility(app, boundsList);
+    SceneBounds bounds;
+    includeSceneBounds(boundsList, bounds);
+    const ViewportTransform fullView = fitSceneBounds(bounds, false, 1280, 720, true);
+    if (!renderStageFrame(app, animator, binding, 1280, 720, pixels, &fullView)) {
         setStatus(app, "No se pudo dibujar el escenario completo.",
                        "Could not render the full stage.");
         return false;
@@ -2938,8 +3390,7 @@ bool exportStageScenePng(AtlasApp& app, const fs::path& folder) {
     const fs::path target = availablePath(folder / fs::u8path(
         safeName(asset->id) + "-scene.png"), false);
     if (target.empty()) return false;
-    const bool ok = stbi_write_png(target.u8string().c_str(), 1280, 720, 4,
-                                   pixels.data(), 1280 * 4) != 0;
+    const bool ok = writePngFile(target, 1280, 720, pixels.data());
     setStatus(app, ok ? "Escenario PNG guardado: " + target.u8string()
                       : "No se pudo guardar el PNG del escenario.",
                    ok ? "Stage PNG saved: " + target.u8string()
@@ -2959,14 +3410,35 @@ bool exportStageSceneGif(AtlasApp& app, const fs::path& folder) {
     output.loop = true;
     output.frames.reserve(static_cast<size_t>(frames));
     const CharacterBinding binding = previewBinding(app);
+    StageAnimator boundsAnimator;
+    boundsAnimator.reset(app.previewStage);
+    boundsAnimator.setPlaying(true);
+    SceneBounds bounds;
+    for (int index = 0; index < frames; ++index) {
+        boundsAnimator.update(app.previewStage, binding, app.atlases,
+            index == 0 ? 0.0f : 1000.0f / fps * app.previewSpeed, app.previewBpm);
+        RenderList list;
+        buildStageRenderList(app.previewStage, binding, app.atlases,
+                             app.renderer, list, &boundsAnimator);
+        applyPreviewVisibility(app, list);
+        includeSceneBounds(list, bounds);
+    }
+    if (!bounds.any) {
+        setStatus(app, "El escenario no tiene capas visibles para exportar.",
+                       "The stage has no visible layers to export.");
+        return false;
+    }
+    const ViewportTransform fullView = fitSceneBounds(bounds, false,
+                                                      output.width, output.height, true);
     StageAnimator animator;
     animator.reset(app.previewStage);
     animator.setPlaying(true);
     for (int index = 0; index < frames; ++index) {
         animator.update(app.previewStage, binding, app.atlases,
-                        index == 0 ? 0.0f : 1000.0f / fps, 100.0f);
+                        index == 0 ? 0.0f : 1000.0f / fps * app.previewSpeed,
+                        app.previewBpm);
         GifRgbaFrame frame;
-        if (!renderStageFrame(app, animator, binding, 960, 540, frame.rgba)) {
+        if (!renderStageFrame(app, animator, binding, 960, 540, frame.rgba, &fullView)) {
             setStatus(app, "No se pudo dibujar un cuadro del GIF del escenario.",
                            "Could not render a stage GIF frame.");
             return false;
@@ -3073,18 +3545,77 @@ bool exportCharacterPreviewGif(AtlasApp& app, const fs::path& folder) {
     return written.ok;
 }
 
+void consumeDroppedPaths(AtlasApp& app) {
+    if (app.dropActive || app.droppedPaths.empty()) return;
+    std::vector<std::string> paths;
+    paths.swap(app.droppedPaths);
+    const bool manual = ImGui::IsPopupOpen(app.spanish ? "Cargar manualmente###manual-import" : "Load manually###manual-import");
+    std::set<std::string> processed;
+    for (const std::string& value : paths) {
+        const fs::path path = fs::u8path(value);
+        if (!processed.insert(normalizedRoot(path)).second) continue;
+        std::error_code error;
+        const bool directory = fs::is_directory(path, error);
+        const std::string extension = lower(path.extension().u8string());
+        const std::string name = lower(path.filename().u8string());
+        bool textureAtlas = false;
+        if (extension == ".xml") {
+            std::ifstream file(path, std::ios::binary);
+            std::array<char, 8192> head{}; file.read(head.data(), head.size());
+            textureAtlas = lower(std::string(head.data(), static_cast<size_t>(file.gcount()))).find("<textureatlas") != std::string::npos;
+        }
+        if (manual) {
+            auto assign = [&](auto& destination, const fs::path& source) { std::snprintf(destination.data(), destination.size(), "%s", source.u8string().c_str()); };
+            if (directory) {
+                if (fs::exists(path / "Animation.json", error)) {
+                    assign(app.manualAtlas, path / "Animation.json");
+                    if (fs::exists(path / "spritemap1.json", error)) assign(app.manualSpritemap, path / "spritemap1.json");
+                    if (fs::exists(path / "spritemap1.png", error)) assign(app.manualImage, path / "spritemap1.png");
+                } else setStatus(app, "Arrastra los archivos de definición, PNG y atlas a la carga manual.", "Drop the definition, PNG and atlas files into manual loading.");
+            } else if (extension == ".png") assign(app.manualImage, path);
+            else if (name.rfind("spritemap", 0) == 0 && extension == ".json") assign(app.manualSpritemap, path);
+            else if (textureAtlas || extension == ".txt" || name == "animation.json") assign(app.manualAtlas, path);
+            else if (extension == ".xml" || extension == ".json" || extension == ".lua") assign(app.manualDefinition, path);
+            continue;
+        }
+        if (textureAtlas) {
+            fs::path image = path; image.replace_extension(".png");
+            if (fs::is_regular_file(image, error)) {
+                if (std::any_of(paths.begin(), paths.end(), [&](const std::string& other) { return normalizedRoot(fs::u8path(other)) == normalizedRoot(image); })) continue;
+                if (!processed.insert(normalizedRoot(image)).second) continue;
+                addSingleResource(app, image);
+                continue;
+            }
+        }
+        if (directory || extension == ".zip") addMod(app, path);
+        else if (extension == ".png" || extension == ".xml" || extension == ".json" || extension == ".lua" || extension == ".txt") addSingleResource(app, path);
+        else setStatus(app, "Tipo de archivo no compatible para arrastrar: " + name, "Unsupported drop file type: " + name);
+    }
+}
+
 void drawHeader(AtlasApp& app, SDL_Window* window) {
+    consumeDroppedPaths(app);
     const bool es = app.spanish;
     ImGui::TextColored(ImVec4(0.89f, 0.76f, 0.57f, 1.0f), "FUNKIN ATLAS - FML TOOL");
-    ImGui::SameLine();
-    ImGui::TextDisabled("/ %s", es ? "estudio de personajes y escenarios" : "character and stage studio");
-    ImGui::SameLine(ImGui::GetWindowWidth() - 95.0f);
+    if (ImGui::GetContentRegionAvail().x > 360.0f) ImGui::SameLine();
+    ImGui::TextDisabled("/ %s · Drag & drop", es ? "personajes y escenarios" : "character and stage studio");
+    if (ImGui::GetWindowWidth() >= 700.0f)
+        ImGui::SameLine(std::max(16.0f, ImGui::GetWindowContentRegionMax().x - 78.0f));
     if (ImGui::SmallButton(es ? "ES  /  EN###language" : "EN  /  ES###language")) { app.spanish = !app.spanish; saveGallery(app); }
     ImGui::Separator();
-    ImGui::SetNextItemWidth(std::max(160.0f, ImGui::GetContentRegionAvail().x - 355.0f));
-    ImGui::InputTextWithHint("##modpath", es ? "Carpeta, ZIP o archivo" : "Mod folder, ZIP or file", app.root.data(), app.root.size());
-    ImGui::SameLine();
-    if (ImGui::Button(es ? "Añadir" : "Add")) {
+    const float actionArea = ImGui::GetContentRegionAvail().x;
+    const bool inlineActions = actionArea >= 730.0f;
+    const bool compactActions = actionArea < 350.0f;
+    const float actionWidth = inlineActions ? 92.0f : std::min(112.0f,
+        (actionArea - ImGui::GetStyle().ItemSpacing.x * (compactActions ? 1.0f : 3.0f)) /
+        (compactActions ? 2.0f : 4.0f));
+    const float inputWidth = inlineActions
+        ? actionArea - actionWidth * 5.0f - ImGui::GetStyle().ItemSpacing.x * 5.0f : -1.0f;
+    ImGui::SetNextItemWidth(inputWidth);
+    ImGui::InputTextWithHint("##modpath", es ? "Arrastra y suelta una carpeta, ZIP o archivo" : "Drag & drop a folder, ZIP or file", app.root.data(), app.root.size());
+    if (app.dropActive) ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(97, 222, 167, 255), 4.0f, 0, 2.0f);
+    if (inlineActions) ImGui::SameLine();
+    if (ImGui::Button(es ? "Añadir" : "Add", ImVec2(actionWidth, 0.0f))) {
         const fs::path path = fs::u8path(app.root.data());
         std::error_code ec;
         if (fs::is_regular_file(path, ec) && lower(path.extension().u8string()) != ".zip")
@@ -3092,12 +3623,12 @@ void drawHeader(AtlasApp& app, SDL_Window* window) {
         else addMod(app, path);
     }
     ImGui::SameLine();
-    if (ImGui::Button(es ? "Carpeta" : "Folder")) {
+    if (ImGui::Button(es ? "Carpeta" : "Folder", ImVec2(actionWidth, 0.0f))) {
         app.dialogAction = DialogAction::Add;
         SDL_ShowOpenFolderDialog(dialogSelected, &app, window, nullptr, false);
     }
-    ImGui::SameLine();
-    if (ImGui::Button("ZIP")) {
+    if (!compactActions) ImGui::SameLine();
+    if (ImGui::Button("ZIP", ImVec2(actionWidth, 0.0f))) {
         static const SDL_DialogFileFilter filtersEs[] = {{"Archivo ZIP", "zip"}};
         static const SDL_DialogFileFilter filtersEn[] = {{"ZIP archive", "zip"}};
         app.dialogAction = DialogAction::Add;
@@ -3105,7 +3636,39 @@ void drawHeader(AtlasApp& app, SDL_Window* window) {
     }
     ImGui::SameLine();
     const char* manualPopup = es ? "Cargar manualmente###manual-import" : "Load manually###manual-import";
-    if (ImGui::Button("Manual")) ImGui::OpenPopup(manualPopup);
+    if (ImGui::Button("Manual", ImVec2(actionWidth, 0.0f))) ImGui::OpenPopup(manualPopup);
+    if (inlineActions) ImGui::SameLine();
+    const std::string modsLabel = std::string(es ? "Mods" : "Mods") +
+        " (" + std::to_string(app.mods.size()) + "/" + std::to_string(kMaxLoadedMods) + ")";
+    if (ImGui::Button(modsLabel.c_str(), ImVec2(actionWidth, 0.0f)))
+        ImGui::OpenPopup("##loaded-mods");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", es
+        ? "Ver las fuentes cargadas o quitar una de ellas."
+        : "View loaded sources or remove one.");
+    if (ImGui::BeginPopup("##loaded-mods")) {
+        ImGui::TextDisabled("%s", es ? "MODS CARGADOS" : "LOADED MODS");
+        ImGui::Separator();
+        if (app.mods.empty()) ImGui::TextDisabled("%s", es ? "Aún no hay mods." : "No mods loaded yet.");
+        for (size_t i = 0; i < app.mods.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            const fs::path source = app.mods[i]->catalog.root();
+            const std::string display = app.mods[i]->label == "bin"
+                ? source.parent_path().filename().u8string() : app.mods[i]->label;
+            if (app.selectedMod == static_cast<int>(i))
+                ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.50f, 1.0f), "● %s", display.c_str());
+            else ImGui::TextUnformatted(display.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", source.u8string().c_str());
+            ImGui::SameLine(0.0f, 16.0f);
+            const bool remove = ImGui::SmallButton(es ? "Quitar" : "Remove");
+            ImGui::PopID();
+            if (remove) {
+                removeMod(app, static_cast<int>(i));
+                ImGui::CloseCurrentPopup();
+                break;
+            }
+        }
+        ImGui::EndPopup();
+    }
     ImGui::SetNextWindowSize(ImVec2(650.0f, 0.0f), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal(manualPopup, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted(es ? "CARGAR RECURSO MANUALMENTE" : "LOAD RESOURCE MANUALLY");
@@ -3185,16 +3748,10 @@ void drawHeader(AtlasApp& app, SDL_Window* window) {
         if (!statusText(app).empty()) ImGui::TextWrapped("%s", statusText(app).c_str());
         ImGui::EndPopup();
     }
-    for (size_t i = 0; i < app.mods.size(); ++i) {
-        ImGui::PushID(static_cast<int>(i));
-        if (i > 0) ImGui::SameLine();
-        ImGui::Text("%s", app.mods[i]->label.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("x")) { removeMod(app, static_cast<int>(i)); ImGui::PopID(); break; }
-        ImGui::PopID();
-    }
-    if (app.mods.empty()) ImGui::TextDisabled("%s", es ? "Carga hasta tres mods, ZIP o recursos individuales." : "Load up to three mods, ZIPs or individual resources.");
-    if (!statusText(app).empty()) ImGui::TextWrapped("%s", statusText(app).c_str());
+    const std::string& status = statusText(app);
+    if (!status.empty() && status.find(" resources found in ") == std::string::npos &&
+        status.find(" recursos encontrados en ") == std::string::npos)
+        ImGui::TextWrapped("%s", status.c_str());
 }
 
 void drawActorChoice(AtlasApp& app, int role, const char* label) {
@@ -3239,11 +3796,15 @@ const char* stageObjectKind(StageObject::Kind kind) {
 
 fs::path findVsCode() {
 #ifdef _WIN32
+    // En UTF-16 (TextEncoding.hpp): con getenv, un perfil como C:\Users\José
+    // hacia lanzar a `u8path` y "Abrir en VS Code" cerraba Atlas.
     std::vector<fs::path> candidates;
-    if (const char* local = std::getenv("LOCALAPPDATA"))
-        candidates.push_back(fs::u8path(local) / "Programs" / "Microsoft VS Code" / "Code.exe");
-    if (const char* programs = std::getenv("ProgramFiles"))
-        candidates.push_back(fs::u8path(programs) / "Microsoft VS Code" / "Code.exe");
+    const fs::path local = environmentPath("LOCALAPPDATA");
+    if (!local.empty())
+        candidates.push_back(local / "Programs" / "Microsoft VS Code" / "Code.exe");
+    const fs::path programs = environmentPath("ProgramFiles");
+    if (!programs.empty())
+        candidates.push_back(programs / "Microsoft VS Code" / "Code.exe");
     wchar_t found[32768] = {};
     if (SearchPathW(nullptr, L"Code.exe", nullptr, 32768, found, nullptr))
         candidates.emplace_back(found);
@@ -3290,6 +3851,126 @@ const StageScriptInventory& stageScripts(AtlasApp& app, const LoadedMod& mod,
     return app.stageScriptCache.emplace(key, std::move(scripts)).first->second;
 }
 
+int advancedAssetSource(const AtlasApp& app) {
+    for (size_t index = 0; index < app.mods.size(); ++index) {
+        const LoadedMod& mod = *app.mods[index];
+        if (normalizedRoot(mod.catalog.root()) != app.assetViewer.root) continue;
+        for (const ModExplorerAsset& asset : mod.catalog.assets())
+            if (asset.key == app.assetViewer.sourceKey) return static_cast<int>(index);
+    }
+    return -1;
+}
+
+bool openAdvancedStageAsset(AtlasApp& app, int index) {
+    const ModExplorerAsset* asset = selectedAsset(app);
+    if (!asset || asset->kind != ModExplorerAsset::Kind::Stage || app.selectedMod < 0 ||
+        index < 0 || index >= static_cast<int>(app.previewStage.objects.size())) return false;
+    const StageObject& object = app.previewStage.objects[static_cast<size_t>(index)];
+    if (!canInspectStageAsset(object)) {
+        setStatus(app, "Los personajes se inspeccionan en Characters; este visor es para las capas del escenario.",
+                       "Character actors belong in Characters; this viewer is for stage layers.");
+        return false;
+    }
+    const LoadedMod& mod = *app.mods[static_cast<size_t>(app.selectedMod)];
+    auto& viewer = app.assetViewer;
+    viewer.releaseTextures();
+    viewer = {};
+    viewer.root = normalizedRoot(mod.catalog.root());
+    viewer.sourceKey = asset->key;
+    viewer.sourceLabel = mod.label;
+    viewer.stageId = asset->id;
+    viewer.definition = asset->sourcePath;
+    viewer.format = modExplorerFormatName(asset->format);
+    viewer.resource = inspectStageAsset(mod.catalog.vfs(), object);
+    const int animation = app.animator.animIndexOf(static_cast<size_t>(index), object);
+    viewer.animation = std::max(0, animation);
+    viewer.prepare(app.animator.frameOf(static_cast<size_t>(index)));
+    viewer.loop = viewer.animation >= 0 && viewer.animation < static_cast<int>(viewer.resource.animations.size())
+        ? viewer.resource.animations[static_cast<size_t>(viewer.animation)].loop : true;
+    for (size_t user : stageAssetUsers(app.previewStage, object)) {
+        const StageObject& shared = app.previewStage.objects[user];
+        viewer.users.emplace_back(user, shared.name.empty() ? shared.spritePath : shared.name);
+    }
+    const auto& inventory = stageScripts(app, mod, *asset, app.previewStage);
+    size_t inspectedBytes = 0;
+    auto addScript = [&](const std::string& path, bool global) {
+        bool match = false;
+        const auto entry = mod.catalog.vfs().find(path);
+        if (viewer.scripts.size() < 256 && entry && entry->size <= 1024u * 1024u &&
+            entry->size <= 8u * 1024u * 1024u - inspectedBytes) {
+            const auto text = mod.catalog.vfs().readText(path);
+            inspectedBytes += static_cast<size_t>(entry->size);
+            if (text) {
+                const std::string source = lower(*text);
+                for (const std::string& token : {object.name, object.spritePath, object.resolvedImage, object.resolvedAtlas})
+                    if (token.size() >= 3 && source.find(lower(token)) != std::string::npos) { match = true; break; }
+            }
+        }
+        viewer.scripts.push_back({path, global, match});
+    };
+    for (const std::string& path : inventory.local) addScript(path, false);
+    for (const std::string& path : inventory.global) addScript(path, true);
+    viewer.open = viewer.appearing = true;
+    return true;
+}
+
+bool exportAdvancedStageAsset(AtlasApp& app, DialogAction action, const fs::path& folder) {
+    const int source = advancedAssetSource(app);
+    if (source < 0 || !app.assetViewer.open) {
+        setStatus(app, "La fuente del recurso ya no está cargada.", "The asset source is no longer loaded.");
+        return false;
+    }
+    using atlas_ui::StageAssetExport;
+    const StageAssetExport type = action == DialogAction::AssetPosePng ? StageAssetExport::Png :
+        action == DialogAction::AssetAnimationGif ? StageAssetExport::Gif :
+        action == DialogAction::AssetMountedSheet ? StageAssetExport::Sheet :
+        action == DialogAction::AssetBlockPng ? StageAssetExport::BlockPng :
+        action == DialogAction::AssetAnimationBatch ? StageAssetExport::AnimationBatch : StageAssetExport::SourceZip;
+    const auto& viewer = app.assetViewer;
+    const std::string assetName = safeName(viewer.resource.object.name.empty()
+        ? fs::u8path(viewer.resource.object.spritePath).filename().u8string() : viewer.resource.object.name);
+    const std::string animationName = viewer.animation >= 0 && viewer.animation < static_cast<int>(viewer.resource.animations.size())
+        ? "-" + safeName(viewer.resource.animations[static_cast<size_t>(viewer.animation)].name) : "";
+    const std::string suffix = type == StageAssetExport::Png ? "-pose.png" : type == StageAssetExport::Gif ? ".gif" :
+        type == StageAssetExport::Sheet ? "-frames" : type == StageAssetExport::BlockPng ? "-block.png" : type == StageAssetExport::AnimationBatch ? "-animations" : "-visual-files.zip";
+    const fs::path target = availablePath(folder / fs::u8path(assetName + animationName + suffix), type == StageAssetExport::Sheet || type == StageAssetExport::AnimationBatch);
+    std::string message;
+    const bool ok = atlas_ui::exportStageAssetViewer(app.assetViewer, app.mods[static_cast<size_t>(source)]->catalog.vfs(), type, target, message);
+    setStatus(app, (ok ? "Guardado: " : "No se pudo exportar: ") + message,
+                   (ok ? "Saved: " : "Export failed: ") + message);
+    return ok;
+}
+
+void drawAdvancedStageAsset(AtlasApp& app, SDL_Window* window) {
+    if (!app.assetViewer.open) return;
+    const int source = advancedAssetSource(app);
+    if (source < 0) {
+        app.assetViewer.close();
+        setStatus(app, "Se cerró el visor porque su fuente se descargó.", "Asset Viewer closed because its source was unloaded.");
+        return;
+    }
+    atlas_ui::drawStageAssetViewer(app.assetViewer, app.mods[static_cast<size_t>(source)]->catalog.vfs(), app.spanish,
+        [&](atlas_ui::StageAssetExport type) {
+            app.dialogAction = type == atlas_ui::StageAssetExport::Png ? DialogAction::AssetPosePng :
+                type == atlas_ui::StageAssetExport::Gif ? DialogAction::AssetAnimationGif :
+                type == atlas_ui::StageAssetExport::Sheet ? DialogAction::AssetMountedSheet :
+                type == atlas_ui::StageAssetExport::BlockPng ? DialogAction::AssetBlockPng :
+                type == atlas_ui::StageAssetExport::AnimationBatch ? DialogAction::AssetAnimationBatch : DialogAction::AssetSourceZip;
+            SDL_ShowOpenFolderDialog(dialogSelected, &app, window, nullptr, false);
+        }, [&](const std::string& path, bool file) {
+            if (!file) { openSourceFolder(app, source, path); return; }
+            const auto resolved = app.mods[static_cast<size_t>(source)]->catalog.vfs().resolve(path);
+            if (!resolved) { setStatus(app, "Archivo no encontrado.", "File not found."); return; }
+#ifdef _WIN32
+            const fs::path editor = findVsCode();
+            const std::wstring argument = L"\"" + resolved->wstring() + L"\"";
+            const INT_PTR result = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open",
+                editor.empty() ? L"notepad.exe" : editor.c_str(), argument.c_str(), nullptr, SW_SHOWNORMAL));
+            if (result <= 32) setStatus(app, "No se pudo abrir el editor.", "Could not open the editor.");
+#endif
+        });
+}
+
 void drawStageSidebar(AtlasApp& app, const LoadedMod& mod, const ModExplorerAsset& asset,
                       SDL_Window* window) {
     const bool es = app.spanish;
@@ -3303,11 +3984,6 @@ void drawStageSidebar(AtlasApp& app, const LoadedMod& mod, const ModExplorerAsse
     if (ImGui::SmallButton(es ? "Abrir carpeta del stage" : "Open stage folder"))
         openSourceFolder(app, app.selectedMod, asset.sourcePath);
     ImGui::TextDisabled("%s", es ? "PERSONAJES Y POSICIONES" : "ACTORS AND POSITIONS");
-    ImGui::Checkbox(es ? "Mostrar personajes en el escenario" : "Show characters on stage",
-                    &app.showStageCharacters);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", es
-        ? "Apagado por defecto, incluso al cargar una canción; solo cambia la vista."
-        : "Off by default, including when loading a song; preview only.");
     if (ImGui::Button(es ? "Usar posiciones declaradas en el stage" : "Use positions declared by stage")) {
         const UniversalStage& original = std::get<UniversalStage>(asset.parsed);
         int restored = 0;
@@ -3347,8 +4023,9 @@ void drawStageSidebar(AtlasApp& app, const LoadedMod& mod, const ModExplorerAsse
         for (StageObject& object : stage.objects) {
             if (object.kind != roles[role]) continue;
             float position[2] = {object.position.x, object.position.y};
+            ImGui::TextDisabled("%s", es ? "Posición X / Y" : "Position X / Y");
             ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::DragFloat2(es ? "Posición###role-position" : "Position###role-position", position, 1.0f)) {
+            if (ImGui::DragFloat2("##role-position", position, 1.0f)) {
                 object.position = {position[0], position[1]};
                 app.animator.reset(stage);
                 app.songLab.viewDirty = true;
@@ -3357,7 +4034,8 @@ void drawStageSidebar(AtlasApp& app, const LoadedMod& mod, const ModExplorerAsse
         }
         ImGui::PopID();
     }
-    ImGui::TextDisabled("%s", es ? "Las posiciones ajustadas aquí son solo de vista previa." : "Position adjustments here affect the preview only.");
+    ImGui::TextWrapped("%s", es ? "Las posiciones ajustadas aquí son solo de vista previa."
+                                   : "Position adjustments here affect the preview only.");
     ImGui::Separator();
     if (ImGui::CollapsingHeader(es ? "Jerarquía de la escena###stage-hierarchy" : "Scene hierarchy###stage-hierarchy",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -3382,8 +4060,8 @@ void drawStageSidebar(AtlasApp& app, const LoadedMod& mod, const ModExplorerAsse
                 else stage.objects[i].properties["visible"] = authored->second;
             }
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", es ? "Solo vista previa; no modifica el mod" : "Preview only; does not modify the mod");
+        ImGui::TextDisabled("%s", es ? "Solo vista previa; no modifica el mod"
+                                     : "Preview only; does not modify the mod");
         ImGui::BeginChild("##stage-hierarchy-list", ImVec2(0.0f, 330.0f), true);
         ImGui::TextDisabled("%s", es ? "ESCENA · ORDEN DE DIBUJO" : "SCENE · DRAW ORDER");
         auto item = [&](size_t index) {
@@ -3402,6 +4080,10 @@ void drawStageSidebar(AtlasApp& app, const LoadedMod& mod, const ModExplorerAsse
                 app.stageAnimationIndex = 0;
             }
             if (ImGui::BeginPopupContextItem("##object-context")) {
+                if (canInspectStageAsset(object) && ImGui::MenuItem("Advanced Asset Viewer")) {
+                    app.selectedStageObject = static_cast<int>(index);
+                    openAdvancedStageAsset(app, static_cast<int>(index));
+                }
                 if (ImGui::MenuItem(es ? "Seleccionar" : "Select")) {
                     app.selectedStageObject = static_cast<int>(index);
                     app.stageAnimationIndex = 0;
@@ -3458,6 +4140,8 @@ void drawStageInspector(AtlasApp& app, const LoadedMod& mod, const ModExplorerAs
             StageObject& object = stage.objects[index];
             ImGui::Text("%s · %s", object.name.empty() ? "—" : object.name.c_str(),
                         stageObjectKind(object.kind));
+            if (canInspectStageAsset(object) && ImGui::Button("Advanced Asset Viewer", ImVec2(-1.0f, 0.0f)))
+                openAdvancedStageAsset(app, static_cast<int>(index));
             const auto visibility = object.properties.find("visible");
             bool shown = visibility == object.properties.end() || visibility->second.asBool();
             if (ImGui::Checkbox(es ? "Visible en preview" : "Visible in preview", &shown))
@@ -3525,26 +4209,22 @@ void drawStageInspector(AtlasApp& app, const LoadedMod& mod, const ModExplorerAs
                 static_cast<int>(object.anims.size()) - 1);
             std::vector<const char*> names;
             for (const AnimationDef& animation : object.anims) names.push_back(animation.name.c_str());
-            ImGui::SetNextItemWidth(190.0f);
-            ImGui::Combo(es ? "Animación" : "Animation", &app.stageAnimationIndex,
+            ImGui::TextDisabled("%s", es ? "Animación" : "Animation");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::Combo("##stage-object-animation", &app.stageAnimationIndex,
                          names.data(), static_cast<int>(names.size()));
-            ImGui::SameLine();
             if (ImGui::SmallButton(es ? "Reproducir" : "Play"))
                 app.animator.play(index, app.stageAnimationIndex);
-            ImGui::SameLine();
             if (ImGui::SmallButton(es ? "Automática" : "Automatic"))
                 app.animator.release(index);
-            ImGui::SameLine();
             ImGui::TextDisabled("%s: %d", es ? "Cuadro" : "Frame", app.animator.frameOf(index) + 1);
             if (ImGui::Checkbox(es ? "Repetir solo vista" : "Loop preview only",
                                 &app.stageLoopPreview))
                 app.stagePoseClock = 0.0;
-            ImGui::SameLine();
             if (ImGui::SmallButton(es ? "Exportar GIF" : "Export GIF")) {
                 app.dialogAction = DialogAction::StageGif;
                 SDL_ShowOpenFolderDialog(dialogSelected, &app, window, nullptr, false);
             }
-            ImGui::SameLine();
             if (ImGui::SmallButton(es ? "Hoja montada" : "Mounted sheet")) {
                 app.dialogAction = DialogAction::StageSheet;
                 SDL_ShowOpenFolderDialog(dialogSelected, &app, window, nullptr, false);
@@ -3587,29 +4267,28 @@ void drawStageInspector(AtlasApp& app, const LoadedMod& mod, const ModExplorerAs
             for (const std::string& script : scripts.global) drawScript(script);
         }
     }
-    ImGui::Separator();
-    if (ImGui::Button(es ? "Escenario PNG" : "Stage PNG")) {
+    ImGui::SeparatorText(es ? "EXPORTAR ESCENARIO" : "EXPORT STAGE");
+    if (ImGui::Button(es ? "Escenario PNG" : "Stage PNG", ImVec2(-1.0f, 0.0f))) {
         app.dialogAction = DialogAction::StageScenePng;
         SDL_ShowOpenFolderDialog(dialogSelected, &app, window, nullptr, false);
     }
-    ImGui::SameLine();
-    if (ImGui::Button(es ? "Escenario GIF" : "Stage GIF")) {
+    if (ImGui::Button(es ? "Escenario GIF" : "Stage GIF", ImVec2(-1.0f, 0.0f))) {
         app.dialogAction = DialogAction::StageSceneGif;
         SDL_ShowOpenFolderDialog(dialogSelected, &app, window, nullptr, false);
     }
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(60.0f);
-    ImGui::DragInt(es ? "Segundos###stage-gif-seconds" : "Seconds###stage-gif-seconds",
-                   &app.stageGifSeconds, 0.2f, 1, 8);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(60.0f);
-    ImGui::DragInt("FPS###stage-gif-fps", &app.stageGifFps, 0.2f, 4, 24);
-    ImGui::TextDisabled("%s", es ? "PNG/GIF usan la vista actual; GIF máximo 72 cuadros."
-                                 : "PNG/GIF use the current view; GIF limit: 72 frames.");
+    ImGui::TextDisabled("%s", es ? "Duración del GIF (segundos)" : "GIF duration (seconds)");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::DragInt("##stage-gif-seconds", &app.stageGifSeconds, 0.2f, 1, 8);
+    ImGui::TextDisabled("FPS");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::DragInt("##stage-gif-fps", &app.stageGifFps, 0.2f, 4, 24);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%s", es ? "PNG/GIF incluyen toda la escena visible, no solo la cámara; GIF máximo 72 cuadros."
+                                : "PNG/GIF include the full visible scene, not just the camera; GIF limit: 72 frames.");
+    ImGui::PopStyleColor();
     ImGui::Checkbox(es ? "Incluir GIF animados en ZIP" : "Include animated GIFs in ZIP",
                     &app.includeStageGifs);
-    ImGui::SameLine();
-    if (ImGui::Button(es ? "ZIP de recursos del escenario" : "Stage assets ZIP")) {
+    if (ImGui::Button(es ? "ZIP de recursos del escenario" : "Stage assets ZIP", ImVec2(-1.0f, 0.0f))) {
         app.dialogAction = DialogAction::StageZip;
         SDL_ShowOpenFolderDialog(dialogSelected, &app, window, nullptr, false);
     }
@@ -3689,15 +4368,18 @@ void drawDataPanel(AtlasApp& app, SDL_Window* window) {
     ImGui::TextDisabled("%s", es ? "Formato de destino" : "Target format");
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::Combo("##export-target", &app.exportTarget, targets, 4);
-    if (ImGui::Button(es ? "Elegir carpeta y exportar" : "Choose folder and export")) {
-        app.dialogAction = DialogAction::Export;
-        SDL_ShowOpenFolderDialog(dialogSelected, &app, window, nullptr, false);
-    }
+    if (ImGui::Button(es ? "Revisar y exportar" : "Review and export")) openExportReview(app, app.selectedMod, app.selectedAsset);
+    if (ImGui::Button(es ? "Añadir al lote" : "Add to batch")) { addExportJob(app, app.selectedMod, app.selectedAsset); app.exportQueue.open = app.exportQueue.appearing = true; }
     ImGui::TextWrapped("%s", app.exportTarget == 0
         ? (es ? "Los originales conservan scripts, pero esta app no los ejecuta ni verifica."
               : "Original files preserve scripts, but this app does not run or verify them.")
         : (es ? "Solo aspecto visual/decorativo. No se traducen scripts, cinemáticas ni mecánicas."
               : "Visual/decorative content only. Scripts, cutscenes and mechanics are not translated."));
+    if (app.exportTarget == 2 && asset->kind == ModExplorerAsset::Kind::Character &&
+        asset->valid && AtlasStore::isAnimatePath(std::get<UniversalCharacter>(asset->parsed).resolvedAtlas))
+        ImGui::TextWrapped("%s", es
+            ? "Animate se convierte a Sparrow. Si necesita varias hojas, el personaje requiere Psych con soporte multi-atlas (1.x); no Psych 0.7.x."
+            : "Animate is converted to Sparrow. Multi-sheet characters require Psych with multi-atlas support (1.x), not Psych 0.7.x.");
     if (!asset->error.empty() || !asset->warnings.empty()) {
         ImGui::Spacing();
         ImGui::SeparatorText(es ? "DIAGNÓSTICOS" : "DIAGNOSTICS");
@@ -3727,10 +4409,11 @@ void drawViewControls(AtlasApp& app) {
         app.previewZoom = 1.0f;
         app.previewPanX = 0.0f;
         app.previewPanY = 0.0f;
+        if (asset->kind == ModExplorerAsset::Kind::Character)
+            app.characterFrameValid = false;
     }
     if (asset->kind == ModExplorerAsset::Kind::Stage) {
         ImGui::Checkbox(es ? "Encuadre automático" : "Auto frame", &app.autoFrame);
-        ImGui::Checkbox(es ? "Mostrar personajes" : "Show characters", &app.showStageCharacters);
         if (!songLabViewActive(app)) {
             ImGui::TextDisabled("%s", es ? "BPM del escenario" : "Stage BPM");
             ImGui::SetNextItemWidth(-1.0f);
@@ -3805,7 +4488,9 @@ void drawCharacterPairControls(AtlasApp& app, SDL_Window* window) {
     const bool es = app.spanish;
     const auto& assets = app.mods[static_cast<size_t>(app.selectedMod)]->catalog.assets();
     ImGui::SeparatorText(es ? "PERSONAJES EN VISTA" : "PREVIEW CHARACTERS");
-    ImGui::TextWrapped("%s: %s", es ? "Editando" : "Editing", asset->id.c_str());
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.50f, 1.0f), "%s",
+                       es ? "EDITANDO AHORA" : "EDITING NOW");
+    ImGui::TextWrapped("%s", asset->id.c_str());
     ImGui::Checkbox(es ? "Mostrar spritesheet en vivo" : "Show live spritesheet",
                     &app.showLiveSheet);
     const std::string companion = app.secondaryAssetIndex >= 0 &&
@@ -3829,7 +4514,10 @@ void drawCharacterPairControls(AtlasApp& app, SDL_Window* window) {
         ImGui::EndCombo();
     }
     if (app.secondaryAssetIndex >= 0) {
-        if (ImGui::Button(es ? "Editar el otro personaje" : "Edit other character"))
+        ImGui::TextDisabled("%s: %s", es ? "También en vista" : "Also in preview",
+                            companion.c_str());
+        const std::string editOther = std::string(es ? "Editar " : "Edit ") + companion;
+        if (ImGui::Button(editOther.c_str(), ImVec2(-1.0f, 0.0f)))
             switchActiveCharacter(app);
         const char* modesEs[] = {"Editado", "Segundo", "Ambos"};
         const char* modesEn[] = {"Editing", "Second", "Both"};
@@ -3885,10 +4573,24 @@ void drawDetail(AtlasApp& app, SDL_Window* window) {
         return;
     }
     const LoadedMod& mod = *app.mods[static_cast<size_t>(app.selectedMod)];
-    ImGui::SeparatorText(asset->id.c_str());
-    const float available = ImGui::GetContentRegionAvail().x;
+    if (asset->kind == ModExplorerAsset::Kind::Character) {
+        ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.50f, 1.0f),
+                           "%s: %s", es ? "EDITANDO" : "EDITING", asset->id.c_str());
+        if (app.secondaryAssetIndex >= 0 && app.selectedMod >= 0) {
+            const auto& assets = app.mods[static_cast<size_t>(app.selectedMod)]->catalog.assets();
+            if (app.secondaryAssetIndex < static_cast<int>(assets.size()))
+                ImGui::TextDisabled("%s: %s", es ? "Segundo en vista" : "Second in preview",
+                                    assets[static_cast<size_t>(app.secondaryAssetIndex)].id.c_str());
+        }
+        ImGui::Separator();
+    } else ImGui::SeparatorText(asset->id.c_str());
+    const ImVec2 previewArea = ImGui::GetContentRegionAvail();
+    const float available = previewArea.x;
     const bool character = asset->valid && asset->kind == ModExplorerAsset::Kind::Character;
-    const float previewH = std::clamp(available * 0.54f, 210.0f, 460.0f);
+    const size_t previewTab = character ? 0u : 1u;
+    const float maxPreviewH = std::max(210.0f, std::min(1400.0f, ImGui::GetWindowHeight() - 110.0f));
+    const float previewH = std::clamp(app.previewHeights[previewTab] > 0.0f
+        ? app.previewHeights[previewTab] : available * 0.54f, 180.0f, maxPreviewH);
     const float previewW = character && app.showLiveSheet && available >= 560.0f
         ? std::max(260.0f, available * 0.57f) : 0.0f;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
@@ -3937,7 +4639,6 @@ void drawDetail(AtlasApp& app, SDL_Window* window) {
                     StageObject& actor = app.previewStage.objects[static_cast<size_t>(app.draggingActorObject)];
                     actor.position.x += dx * std::cos(angle) + dy * std::sin(angle);
                     actor.position.y += dy * std::cos(angle) - dx * std::sin(angle);
-                    app.characterFrameValid = false;
                 }
                 break;
             }
@@ -3975,6 +4676,7 @@ void drawDetail(AtlasApp& app, SDL_Window* window) {
     app.previewBoundsMin = ImGui::GetItemRectMin();
     app.previewBoundsMax = ImGui::GetItemRectMax();
     app.previewBoundsValid = true;
+    app.previewWindowId = atlasCurrentWindowId();
     app.previewWheel = 0.0f;
     if (character) {
         if (!app.showLiveSheet) for (LiveSheetViewState& sheet : app.liveSheetViews)
@@ -3997,8 +4699,31 @@ void drawDetail(AtlasApp& app, SDL_Window* window) {
                                       previewH, "##live-sheet-primary");
             }
         }
-        drawCharacterTools(app, window);
     }
+    ImGui::InvisibleButton("##preview-height-resize", ImVec2(-1.0f, 12.0f));
+    const ImVec2 gripMin = ImGui::GetItemRectMin();
+    const ImVec2 gripMax = ImGui::GetItemRectMax();
+    const float gripCenter = (gripMin.x + gripMax.x) * 0.5f;
+    const ImU32 gripColor = ImGui::GetColorU32(ImGui::IsItemHovered() || ImGui::IsItemActive()
+        ? ImGuiCol_ButtonHovered : ImGuiCol_Border);
+    for (float offset : {-3.0f, 0.0f, 3.0f})
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(gripCenter - 28.0f, gripMin.y + 6.0f + offset),
+                                            ImVec2(gripCenter + 28.0f, gripMin.y + 6.0f + offset), gripColor);
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", es
+            ? "Arrastra para cambiar el alto de la vista. Doble clic para restablecer."
+            : "Drag to resize the preview. Double-click to reset.");
+    }
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+        app.previewHeights[previewTab] = std::clamp(previewH + ImGui::GetIO().MouseDelta.y,
+                                                    180.0f, maxPreviewH);
+    if (ImGui::IsItemDeactivated()) saveGallery(app);
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        app.previewHeights[previewTab] = 0.0f;
+        saveGallery(app);
+    }
+    if (character) drawCharacterTools(app, window);
     if (asset->valid && asset->kind == ModExplorerAsset::Kind::Stage) {
         drawStageInspector(app, mod, *asset, window);
     }
@@ -4056,6 +4781,9 @@ void drawResourceList(AtlasApp& app) {
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##asset-filter", es ? "Buscar recurso" : "Search resources", app.filter.data(), app.filter.size());
     ImGui::Checkbox(es ? "Solo galería" : "Gallery only", &app.galleryOnly);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(es ? "Exportar lote" : "Batch export")) app.exportQueue.open = app.exportQueue.appearing = true;
+    if (ImGui::Button(es ? "Comparar A / B" : "Compare A / B", ImVec2(-1, 0))) { app.comparison.open = app.comparison.appearing = true; if (app.comparison.slots[0].source.root.empty()) setComparisonResource(app, 0, resourceReference(app, app.selectedMod, app.selectedAsset)); }
     ImGui::Separator();
     int total = 0;
     for (size_t mod = 0; mod < app.mods.size(); ++mod) {
@@ -4074,7 +4802,17 @@ void drawResourceList(AtlasApp& app) {
             ImGui::PushID(static_cast<int>(mod * 100000 + index));
             if (ImGui::Selectable(asset.id.c_str(), app.selectedMod == static_cast<int>(mod) && app.selectedAsset == static_cast<int>(index)))
                 selectAsset(app, static_cast<int>(mod), static_cast<int>(index));
+            if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                const std::array<int, 2> source{static_cast<int>(mod), static_cast<int>(index)};
+                ImGui::SetDragDropPayload("ATLAS_RESOURCE", source.data(), sizeof(source));
+                ImGui::TextUnformatted(asset.id.c_str());
+                ImGui::EndDragDropSource();
+            }
             if (ImGui::BeginPopupContextItem("##asset-context")) {
+                if (ImGui::MenuItem(es ? "Comparar como A" : "Compare as A")) openComparison(app, 0, static_cast<int>(mod), static_cast<int>(index));
+                if (ImGui::MenuItem(es ? "Comparar como B" : "Compare as B")) openComparison(app, 1, static_cast<int>(mod), static_cast<int>(index));
+                if (ImGui::MenuItem(es ? "Revisar exportación" : "Review export")) openExportReview(app, static_cast<int>(mod), static_cast<int>(index));
+                if (ImGui::MenuItem(es ? "Añadir a exportación múltiple" : "Add to batch export")) addExportJob(app, static_cast<int>(mod), static_cast<int>(index));
                 if (ImGui::MenuItem(es ? "Ver recurso" : "View resource"))
                     selectAsset(app, static_cast<int>(mod), static_cast<int>(index));
                 if (ImGui::MenuItem(es ? "Vista rápida" : "Quick preview")) {
@@ -4111,8 +4849,9 @@ void drawQuickPreview(AtlasApp& app) {
     const ModExplorerAsset& asset = mod.catalog.assets()[static_cast<size_t>(app.quickAsset)];
     bool open = true;
     const std::string title = (app.spanish ? "Vista rápida: " : "Quick preview: ") + asset.id + "###quick-preview";
-    const ImVec2 display = ImGui::GetIO().DisplaySize;
-    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f),
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + viewport->Size.x * 0.5f,
+                                    viewport->Pos.y + viewport->Size.y * 0.5f),
                             ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::Begin(title.c_str(), &open, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::Text("%s · %s", asset.id.c_str(), modExplorerFormatName(asset.format));
@@ -4233,13 +4972,94 @@ void drawQuickPreview(AtlasApp& app) {
     if (!open) app.quickMod = app.quickAsset = -1;
 }
 
+void drawAtlasPanel(AtlasApp& app, SDL_Window* window, int panel, bool floating) {
+    const bool es = app.spanish;
+    const char* namesEs[3] = {"Datos", "Área de trabajo", "Recursos"};
+    const char* namesEn[3] = {"Data", "Workspace", "Resources"};
+    ImGui::PushID(panel);
+    ImGui::TextDisabled("%s", es ? namesEs[panel] : namesEn[panel]);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(floating ? (es ? "Reinsertar" : "Dock")
+                                    : (es ? "Extraer" : "Pop out"))) {
+        app.panelDetached[static_cast<size_t>(panel)] = !floating;
+        if (panel == 0) app.selectLeftPanelTab = true;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", floating
+        ? (es ? "Devuelve este panel a la ventana principal."
+              : "Return this panel to the main window.")
+        : (es ? "Abre un panel flotante; arrástralo fuera para separarlo."
+              : "Open a floating panel; drag it outside to make a separate window."));
+    ImGui::Separator();
+    if (panel == 0) {
+        const ModExplorerAsset* active = selectedAsset(app);
+        if (active && app.selectedMod >= 0) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f, 0.16f, 0.18f, 1.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 8.0f));
+            ImGui::BeginChild("##current-resource", ImVec2(0.0f, 90.0f), true,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImGui::TextDisabled("%s", active->kind == ModExplorerAsset::Kind::Character
+                ? (es ? "PERSONAJE QUE EDITAS" : "CHARACTER YOU ARE EDITING")
+                : (es ? "ESCENARIO ACTUAL" : "CURRENT STAGE"));
+            ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.50f, 1.0f), "%s", active->id.c_str());
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", active->sourcePath.c_str());
+            ImGui::TextDisabled("%s · %s", app.mods[static_cast<size_t>(app.selectedMod)]->label.c_str(),
+                                modExplorerFormatName(active->format));
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+        }
+        ImGui::Spacing();
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 7.0f));
+        if (ImGui::BeginTabBar("##left-panels", ImGuiTabBarFlags_FittingPolicyScroll)) {
+            const bool requested = app.selectLeftPanelTab;
+            const int requestedTab = app.leftPanelTab;
+            if (ImGui::BeginTabItem(es ? "Vista###left-view" : "View###left-view", nullptr,
+                                    requested && requestedTab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                app.leftPanelTab = 0;
+                drawCharacterPairControls(app, window);
+                drawLivePanelData(app);
+                drawViewControls(app);
+                const ModExplorerAsset* asset = selectedAsset(app);
+                if (asset && asset->valid && asset->kind == ModExplorerAsset::Kind::Stage)
+                    drawStageSidebar(app, *app.mods[static_cast<size_t>(app.selectedMod)], *asset, window);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem(es ? "Canciones###left-songs" : "Songs###left-songs", nullptr,
+                                    requested && requestedTab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                app.leftPanelTab = 1;
+                drawSongLab(app);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem(es ? "Recurso###left-resource" : "Resource###left-resource", nullptr,
+                                    requested && requestedTab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                app.leftPanelTab = 2;
+                drawDataPanel(app, window);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+            if (requested) app.selectLeftPanelTab = false;
+        }
+        ImGui::PopStyleVar();
+        if (!app.capturePath.empty() && app.captureLeftScroll > 0)
+            ImGui::SetScrollY(static_cast<float>(app.captureLeftScroll));
+    } else if (panel == 1) {
+        drawDetail(app, window);
+        if (!app.capturePath.empty() && app.captureDetailScroll > 0)
+            ImGui::SetScrollY(static_cast<float>(app.captureDetailScroll));
+    } else {
+        drawResourceList(app);
+    }
+    ImGui::PopID();
+}
+
 void draw(AtlasApp& app, SDL_Window* window) {
     processDialog(app);
     songLabPollAudio(app);
     app.sheetBoundsValid = false;
-    const ImVec2 display = ImGui::GetIO().DisplaySize;
-    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-    ImGui::SetNextWindowSize(display);
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGui::SetNextWindowPos(viewport->Pos);
+    ImGui::SetNextWindowSize(viewport->Size);
     ImGui::Begin("##funkin-atlas", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
     drawHeader(app, window);
@@ -4262,6 +5082,16 @@ void draw(AtlasApp& app, SDL_Window* window) {
             }
         }
     }
+    if (app.tab == 1) {
+        const ModExplorerAsset* stage = selectedAsset(app);
+        if (stage && stage->kind == ModExplorerAsset::Kind::Stage) {
+            ImGui::Checkbox(app.spanish ? "Mostrar personajes en escenario"
+                                     : "Show characters on stage", &app.showStageCharacters);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", app.spanish
+                ? "Apagado por defecto, incluso al cargar una canción; solo cambia la vista."
+                : "Off by default, including when loading a song; preview only.");
+        }
+    }
     const std::string missing = firstMissingGalleryKey(app);
     if (!missing.empty()) {
         ImGui::TextColored(ImVec4(0.96f, 0.69f, 0.42f, 1.0f), "%s", app.spanish ? "Falta una fuente guardada en la galería" : "A saved gallery source is missing");
@@ -4279,45 +5109,145 @@ void draw(AtlasApp& app, SDL_Window* window) {
             saveGallery(app);
         }
     }
-    const float width = ImGui::GetContentRegionAvail().x;
-    const float left = std::clamp(width * 0.25f, 290.0f, 355.0f);
-    const float right = std::clamp(width * 0.23f, 285.0f, 335.0f);
-    ImGui::BeginChild("##data", ImVec2(left, 0.0f), true);
-    if (ImGui::BeginTabBar("##left-panels")) {
-        if (ImGui::BeginTabItem(app.spanish ? "Vista###left-view" : "View###left-view")) {
-            drawCharacterPairControls(app, window);
-            drawLivePanelData(app);
-            drawViewControls(app);
-            const ModExplorerAsset* asset = selectedAsset(app);
-            if (asset && asset->valid && asset->kind == ModExplorerAsset::Kind::Stage)
-                drawStageSidebar(app, *app.mods[static_cast<size_t>(app.selectedMod)], *asset, window);
-            ImGui::EndTabItem();
+    const std::array<bool, 3> detached = app.panelDetached;
+    std::array<int, 3> attached{};
+    int count = 0;
+    for (int panel = 0; panel < 3; ++panel)
+        if (!detached[static_cast<size_t>(panel)]) attached[static_cast<size_t>(count++)] = panel;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    const float height = std::max(100.0f, available.y);
+    if (count == 0) {
+        ImGui::TextDisabled("%s", app.spanish
+            ? "Todos los paneles están fuera de la ventana principal."
+            : "All panels are outside the main window.");
+        const char* namesEs[3] = {"Datos", "Área de trabajo", "Recursos"};
+        const char* namesEn[3] = {"Data", "Workspace", "Resources"};
+        for (int panel = 0; panel < 3; ++panel) {
+            ImGui::PushID(panel);
+            if (panel) ImGui::SameLine();
+            if (ImGui::Button(app.spanish ? namesEs[panel] : namesEn[panel]))
+                app.panelDetached[static_cast<size_t>(panel)] = false;
+            ImGui::PopID();
         }
-        if (ImGui::BeginTabItem(app.spanish ? "Canciones###left-songs" : "Songs###left-songs")) {
-            drawSongLab(app);
-            ImGui::EndTabItem();
+    } else {
+        constexpr float gutter = 8.0f;
+        const float usable = std::max(1.0f, available.x - gutter * (count - 1));
+        const float targetMinimum[3] = {180.0f, 260.0f, 180.0f};
+        std::array<float, 3> minimum{};
+        std::array<float, 3> widths{};
+        float minimumSum = 0.0f;
+        float weightSum = 0.0f;
+        for (int i = 0; i < count; ++i) {
+            const int panel = attached[static_cast<size_t>(i)];
+            minimumSum += targetMinimum[panel];
+            weightSum += app.panelWeights[static_cast<size_t>(panel)];
         }
-        if (ImGui::BeginTabItem(app.spanish ? "Recurso###left-resource" : "Resource###left-resource")) {
-            drawDataPanel(app, window);
-            ImGui::EndTabItem();
+        const float minimumScale = std::min(1.0f, usable / minimumSum);
+        const float extra = std::max(0.0f, usable - minimumSum * minimumScale);
+        for (int i = 0; i < count; ++i) {
+            const int panel = attached[static_cast<size_t>(i)];
+            minimum[static_cast<size_t>(panel)] = targetMinimum[panel] * minimumScale;
+            widths[static_cast<size_t>(panel)] = minimum[static_cast<size_t>(panel)] +
+                extra * app.panelWeights[static_cast<size_t>(panel)] / weightSum;
         }
-        ImGui::EndTabBar();
+        float x = origin.x;
+        for (int i = 0; i < count; ++i) {
+            const int panel = attached[static_cast<size_t>(i)];
+            ImGui::SetCursorScreenPos(ImVec2(x, origin.y));
+            const char* ids[3] = {"##data", "##workspace", "##resources"};
+            ImGui::BeginChild(ids[panel], ImVec2(widths[static_cast<size_t>(panel)], height), true);
+            drawAtlasPanel(app, window, panel, false);
+            ImGui::EndChild();
+            x += widths[static_cast<size_t>(panel)];
+            if (i + 1 == count) continue;
+            const int next = attached[static_cast<size_t>(i + 1)];
+            ImGui::PushID(i);
+            ImGui::SetCursorScreenPos(ImVec2(x, origin.y));
+            ImGui::InvisibleButton("##panel-splitter", ImVec2(gutter, height));
+            const ImVec2 min = ImGui::GetItemRectMin();
+            const ImVec2 max = ImGui::GetItemRectMax();
+            const ImU32 color = ImGui::GetColorU32(ImGui::IsItemActive()
+                ? ImGuiCol_ButtonActive : ImGui::IsItemHovered()
+                ? ImGuiCol_ButtonHovered : ImGuiCol_Border);
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                ImVec2(min.x + gutter * 0.35f, min.y + 8.0f),
+                ImVec2(max.x - gutter * 0.35f, max.y - 8.0f), color, 2.0f);
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            if (ImGui::IsItemActive()) {
+                const float pairExtra = widths[static_cast<size_t>(panel)] +
+                    widths[static_cast<size_t>(next)] - minimum[static_cast<size_t>(panel)] -
+                    minimum[static_cast<size_t>(next)];
+                if (pairExtra > 2.0f) {
+                    const float firstExtra = std::clamp(
+                        widths[static_cast<size_t>(panel)] + ImGui::GetIO().MouseDelta.x -
+                        minimum[static_cast<size_t>(panel)], 0.0f, pairExtra);
+                    const float pairWeight = app.panelWeights[static_cast<size_t>(panel)] +
+                        app.panelWeights[static_cast<size_t>(next)];
+                    app.panelWeights[static_cast<size_t>(panel)] = pairWeight *
+                        std::clamp(firstExtra / pairExtra, 0.01f, 0.99f);
+                    app.panelWeights[static_cast<size_t>(next)] = pairWeight -
+                        app.panelWeights[static_cast<size_t>(panel)];
+                }
+            }
+            ImGui::PopID();
+            x += gutter;
+        }
+        ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + height));
     }
-    ImGui::EndChild();
-    ImGui::SameLine();
-    ImGui::BeginChild("##workspace", ImVec2(-right - 10.0f, 0.0f), true);
-    drawDetail(app, window);
-    if (!app.capturePath.empty() && app.captureDetailScroll > 0)
-        ImGui::SetScrollY(static_cast<float>(app.captureDetailScroll));
-    ImGui::EndChild();
-    ImGui::SameLine();
-    ImGui::BeginChild("##resources", ImVec2(0.0f, 0.0f), true);
-    drawResourceList(app);
-    ImGui::EndChild();
-    if (!app.sheetBoundsValid) app.sheetWheel = 0.0f;
     ImGui::End();
+    const char* titlesEs[3] = {"Datos###atlas-float-data", "Área de trabajo###atlas-float-workspace",
+                               "Recursos###atlas-float-resources"};
+    const char* titlesEn[3] = {"Data###atlas-float-data", "Workspace###atlas-float-workspace",
+                               "Resources###atlas-float-resources"};
+    for (int panel = 0; panel < 3; ++panel) {
+        if (!detached[static_cast<size_t>(panel)]) continue;
+        const float initialX = panel == 0 ? 24.0f : panel == 1 ? 120.0f
+            : std::max(24.0f, viewport->Size.x - 404.0f);
+        const float initialY = panel == 1 ? 72.0f : 176.0f;
+        ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + initialX,
+                                        viewport->Pos.y + initialY),
+                                ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(panel == 1 ? ImVec2(760.0f, 680.0f)
+                                           : ImVec2(380.0f, 650.0f), ImGuiCond_FirstUseEver);
+        bool open = true;
+        if (ImGui::Begin(app.spanish ? titlesEs[panel] : titlesEn[panel], &open,
+                         ImGuiWindowFlags_NoCollapse))
+            drawAtlasPanel(app, window, panel, true);
+        ImGui::End();
+        if (!open) {
+            app.panelDetached[static_cast<size_t>(panel)] = false;
+            if (panel == 0) app.selectLeftPanelTab = true;
+        }
+    }
+    if (!app.sheetBoundsValid) app.sheetWheel = 0.0f;
+    drawAdvancedStageAsset(app, window);
+    drawExportTools(app, window);
+    drawComparison(app);
 }
 
+}
+
+// Los argumentos en UTF-8. El `argv` de main llega en ANSI en Windows: arrastrar
+// al .exe una carpeta con una ñ cerraba Atlas (u8path lanzaba) y un nombre
+// japones llegaba como "??" y no se encontraba.
+std::vector<std::string> utf8Arguments(int argc, char** argv) {
+    std::vector<std::string> out;
+#ifdef _WIN32
+    int count = 0;
+    if (LPWSTR* wide = CommandLineToArgvW(GetCommandLineW(), &count)) {
+        try {
+            for (int i = 0; i < count; ++i) out.push_back(fs::path(wide[i]).u8string());
+        } catch (...) {
+            out.clear();
+        }
+        LocalFree(wide);
+        if (!out.empty()) return out;
+    }
+#endif
+    for (int i = 0; i < argc; ++i) out.push_back(ensureUtf8(argv[i] ? argv[i] : ""));
+    return out;
 }
 
 int main(int argc, char** argv) {
@@ -4341,6 +5271,18 @@ int main(int argc, char** argv) {
     SDL_GL_SetSwapInterval(1);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    std::error_code settingsError;
+    const fs::path settingsFolder = galleryPath().parent_path();
+    fs::create_directories(settingsFolder, settingsError);
+    const std::string imguiIniPath = (settingsFolder / "imgui.ini").u8string();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    io.IniFilename = settingsError ? nullptr : imguiIniPath.c_str();
+    // El build no define NDEBUG: un error recuperable de ImGui (un Push/Pop o
+    // Begin/End desparejado en un panel) llamaba a assert y cerraba la app. Se
+    // recupera, se registra y se sigue; los errores no recuperables siguen
+    // parando.
+    io.ConfigErrorRecoveryEnableAssert = false;
     if (!ImGui::GetIO().Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.0f))
         ImGui::GetIO().Fonts->AddFontDefault();
     ImGui::StyleColorsDark();
@@ -4380,6 +5322,7 @@ int main(int argc, char** argv) {
     std::string requestedExport;
     int captureFrames = 20;
     std::string requestedSong;
+    std::string requestedSongSource;
     std::string requestedBackdrop;
     std::string requestedSecond;
     int requestedSongLine = 0;
@@ -4388,6 +5331,20 @@ int main(int argc, char** argv) {
     bool requestedStagePosition = false;
     bool requestedFlipY = false;
     bool requestedHideLiveSheet = false;
+    bool requestedWheelCheck = false;
+    bool requestedExportReview = false, requestedBatch = false, requestedAssetBatch = false;
+    int requestedSheetPage = 0, requestedAssetPage = 0, requestedAssetBlock = -1;
+    int requestedRangeFirst = -1, requestedRangeLast = -1;
+    bool requestedLiveSheet = false;
+    std::string requestedBatchIds, requestedCompare;
+    int requestedCompareMode = 0;
+    std::vector<std::string> requestedDrops;
+    bool requestedAssetViewer = false;
+    bool requestedAssetSheet = false;
+    bool requestedAssetResolved = false;
+    bool requestedAssetWheelCheck = false;
+    std::string requestedAssetAnimation;
+    int requestedAssetInspectorScroll = 0;
     std::array<std::string, 4> requestedSongActions;
     std::array<bool, 4> requestedSongActionSet{};
     std::string requestedSongIdle;
@@ -4395,24 +5352,54 @@ int main(int argc, char** argv) {
     std::string requestedSaveActionPreset;
     std::string requestedLoadActionPreset;
     fs::path requestedExportDir;
-    for (int i = 1; i < argc; ++i) {
-        const std::string argument = argv[i];
+    const std::vector<std::string> arguments = utf8Arguments(argc, argv);
+    for (size_t i = 1; i < arguments.size(); ++i) {
+        const std::string& argument = arguments[i];
         if (argument.rfind("--capture=", 0) == 0) app.capturePath = argument.substr(10);
         else if (argument.rfind("--capture-frames=", 0) == 0)
             captureFrames = std::clamp(std::atoi(argument.c_str() + 17), 20, 600);
         else if (argument.rfind("--song-lab-select=", 0) == 0)
             requestedSong = lower(argument.substr(18));
+        else if (argument.rfind("--song-lab-source=", 0) == 0)
+            requestedSongSource = lower(argument.substr(18));
         else if (argument.rfind("--song-lab-line=", 0) == 0)
             requestedSongLine = std::max(0, std::atoi(argument.c_str() + 16));
         else if (argument.rfind("--song-lab-second-line=", 0) == 0)
             requestedSecondLine = std::max(0, std::atoi(argument.c_str() + 23));
         else if (argument == "--song-lab-share-line") requestedShareLine = true;
         else if (argument == "--song-lab-play") app.songLab.autoPlay = true;
+        else if (argument == "--song-lab-script-audio") app.songLab.applyScriptAudio = true;
         else if (argument.rfind("--backdrop=", 0) == 0)
             requestedBackdrop = lower(argument.substr(11));
         else if (argument == "--use-stage-position") requestedStagePosition = true;
         else if (argument == "--flip-y") requestedFlipY = true;
         else if (argument == "--hide-live-sheet") requestedHideLiveSheet = true;
+        else if (argument == "--check-preview-wheel") requestedWheelCheck = true;
+        else if (argument == "--export-review") requestedExportReview = true;
+        else if (argument.rfind("--review-target=", 0) == 0 || argument.rfind("--batch-target=", 0) == 0) {
+            const std::string target = lower(argument.substr(argument.find('=') + 1));
+            app.exportTarget = target == "psych" ? 2 : target == "codename" ? 3 : target == "vslice" ? 1 : 0;
+        }
+        else if (argument == "--export-batch") requestedBatch = true;
+        else if (argument.rfind("--batch-add=", 0) == 0) { requestedBatchIds = argument.substr(12); requestedBatch = true; }
+        else if (argument.rfind("--compare=", 0) == 0) requestedCompare = argument.substr(10);
+        else if (argument == "--compare-mode=overlay") requestedCompareMode = 1;
+        else if (argument.rfind("--check-drop=", 0) == 0) requestedDrops.push_back(argument.substr(13));
+        else if (argument == "--show-live-sheet") requestedLiveSheet = true;
+        else if (argument.rfind("--sheet-page=", 0) == 0) requestedSheetPage = std::max(0, std::atoi(argument.c_str() + 13) - 1);
+        else if (argument.rfind("--asset-page=", 0) == 0) requestedAssetPage = std::max(0, std::atoi(argument.c_str() + 13) - 1);
+        else if (argument.rfind("--asset-block=", 0) == 0) requestedAssetBlock = std::max(0, std::atoi(argument.c_str() + 14) - 1);
+        else if (argument.rfind("--asset-range=", 0) == 0) {
+            const std::string range = argument.substr(14); const size_t split = range.find(':');
+            if (split != std::string::npos) { requestedRangeFirst = std::atoi(range.substr(0, split).c_str()) - 1; requestedRangeLast = std::atoi(range.substr(split + 1).c_str()) - 1; }
+        }
+        else if (argument == "--asset-batch-all") requestedAssetBatch = true;
+        else if (argument == "--asset-viewer") requestedAssetViewer = true;
+        else if (argument == "--asset-view=sheet") requestedAssetSheet = requestedAssetViewer = true;
+        else if (argument == "--asset-resolved") requestedAssetResolved = true;
+        else if (argument == "--check-asset-wheel") requestedAssetWheelCheck = requestedAssetViewer = true;
+        else if (argument.rfind("--asset-animation=", 0) == 0) requestedAssetAnimation = argument.substr(18);
+        else if (argument.rfind("--asset-inspector-scroll=", 0) == 0) requestedAssetInspectorScroll = std::max(0, std::atoi(argument.c_str() + 25));
         else if (argument.rfind("--song-action-left=", 0) == 0) {
             requestedSongActions[0] = argument.substr(19); requestedSongActionSet[0] = true;
         } else if (argument.rfind("--song-action-down=", 0) == 0) {
@@ -4431,6 +5418,8 @@ int main(int argc, char** argv) {
             app.songLab.initialSeekMs = std::max(0.0, std::atof(argument.c_str() + 16) * 1000.0);
         else if (argument.rfind("--capture-scroll=", 0) == 0)
             app.captureDetailScroll = std::max(0, std::atoi(argument.c_str() + 17));
+        else if (argument.rfind("--capture-left-scroll=", 0) == 0)
+            app.captureLeftScroll = std::max(0, std::atoi(argument.c_str() + 22));
         else if (argument.rfind("--root=", 0) == 0) roots.push_back(argument.substr(7));
         else if (argument.rfind("--manual-definition=", 0) == 0)
             std::snprintf(app.manualDefinition.data(), app.manualDefinition.size(), "%s", argument.c_str() + 20);
@@ -4449,6 +5438,9 @@ int main(int argc, char** argv) {
         }
         else if (argument == "--tab=stage") app.tab = 1;
         else if (argument == "--tab=character") app.tab = 0;
+        else if (argument == "--left-panel=view") app.leftPanelTab = 0;
+        else if (argument == "--left-panel=songs") app.leftPanelTab = 1;
+        else if (argument == "--left-panel=resource") app.leftPanelTab = 2;
         else if (argument == "--lang=en") app.spanish = false;
         else if (argument == "--lang=es") app.spanish = true;
         else if (argument.rfind("--select=", 0) == 0) requestedAsset = lower(argument.substr(9));
@@ -4456,7 +5448,7 @@ int main(int argc, char** argv) {
         else if (argument.rfind("--quick=", 0) == 0) requestedQuick = lower(argument.substr(8));
         else if (argument.rfind("--object=", 0) == 0) requestedObject = lower(argument.substr(9));
         else if (argument.rfind("--export-target=", 0) == 0) requestedExport = lower(argument.substr(16));
-        else if (argument.rfind("--export-dir=", 0) == 0) requestedExportDir = fs::u8path(argument.substr(13));
+        else if (argument.rfind("--export-dir=", 0) == 0) requestedExportDir = pathFromUtf8(argument.substr(13));
         else if (argument.rfind("--gif-seconds=", 0) == 0)
             app.stageGifSeconds = std::clamp(std::atoi(argument.c_str() + 14), 1, 8);
         else if (argument.rfind("--gif-fps=", 0) == 0)
@@ -4475,7 +5467,7 @@ int main(int argc, char** argv) {
         else if (argument.rfind("--", 0) != 0) roots.push_back(argument);
     }
     for (const std::string& root : roots) {
-        const fs::path path = fs::u8path(root);
+        const fs::path path = pathFromUtf8(root);
         std::error_code ec;
         if (fs::is_regular_file(path, ec) && lower(path.extension().u8string()) != ".zip")
             addSingleResource(app, path);
@@ -4514,6 +5506,66 @@ int main(int argc, char** argv) {
                 break;
             }
     }
+    if (requestedExport.rfind("asset", 0) == 0) requestedAssetViewer = true;
+    if (requestedExportReview) openExportReview(app, app.selectedMod, app.selectedAsset);
+    if (requestedBatch || requestedExport == "batch") {
+        auto& queue = app.exportQueue;
+        queue.target = app.exportTarget;
+        std::set<std::string> ids;
+        std::istringstream values(requestedBatchIds); std::string id;
+        while (std::getline(values, id, ',')) ids.insert(lower(id));
+        if (ids.empty()) addExportJob(app, app.selectedMod, app.selectedAsset);
+        else for (size_t mod = 0; mod < app.mods.size(); ++mod) for (size_t index = 0; index < app.mods[mod]->catalog.assets().size(); ++index)
+            if (ids.count("*") || ids.count(lower(app.mods[mod]->catalog.assets()[index].id))) addExportJob(app, static_cast<int>(mod), static_cast<int>(index));
+        queue.open = queue.appearing = true;
+        refreshExportQueue(app);
+    }
+    if (!requestedCompare.empty()) {
+        std::istringstream values(requestedCompare); std::string id; int side = 0;
+        while (side < 2 && std::getline(values, id, ',')) {
+            for (size_t mod = 0; mod < app.mods.size(); ++mod) {
+                const auto& assets = app.mods[mod]->catalog.assets();
+                const auto found = std::find_if(assets.begin(), assets.end(), [&](const ModExplorerAsset& asset) { return lower(asset.id) == lower(id) && visible(app, static_cast<int>(mod), asset); });
+                if (found != assets.end()) { setComparisonResource(app, side, resourceReference(app, static_cast<int>(mod), static_cast<int>(found - assets.begin()))); break; }
+            }
+            ++side;
+        }
+        app.comparison.mode = requestedCompareMode;
+        app.comparison.open = app.comparison.appearing = true;
+    }
+    if (requestedLiveSheet && selectedAsset(app) && selectedAsset(app)->kind == ModExplorerAsset::Kind::Character) {
+        app.showLiveSheet = true;
+        const auto& character = app.previewCharacter;
+        app.characterSheetPages[app.mods[app.selectedMod]->catalog.root().u8string() + "|" + character.sourcePath] = requestedSheetPage;
+    }
+    if (requestedAssetViewer) {
+        if (!openAdvancedStageAsset(app, app.selectedStageObject)) {
+            std::fprintf(stderr, "Advanced Asset Viewer: not a stage layer\n");
+            app.capturePath.clear();
+            requestedExport = "asset-invalid";
+        } else {
+            auto& viewer = app.assetViewer;
+            viewer.resolvedSheet = requestedAssetResolved;
+            viewer.captureInspectorScroll = requestedAssetInspectorScroll;
+            viewer.selectSheetTab = requestedAssetSheet;
+            viewer.page = std::clamp(requestedAssetPage, 0, std::max(0, static_cast<int>(viewer.resource.pages.size()) - 1));
+            if (!requestedAssetAnimation.empty()) {
+                for (size_t index = 0; index < viewer.resource.animations.size(); ++index)
+                    if (viewer.resource.animations[index].name == requestedAssetAnimation) {
+                        viewer.animation = static_cast<int>(index); viewer.prepare(); break;
+                    }
+            }
+            std::fprintf(stdout, "Advanced Asset Viewer: %s, %zu pages, %zu animations, %zu frames%s\n",
+                viewer.resource.object.name.c_str(), viewer.resource.pages.size(), viewer.resource.animations.size(),
+                viewer.prepared.animation.frames.size(), viewer.prepared.ok ? "" : " (unresolved)");
+            if (!viewer.prepared.error.empty()) std::fprintf(stderr, "Asset diagnostics: %s\n", viewer.prepared.error.c_str());
+            if (requestedRangeFirst >= 0 && requestedRangeLast >= requestedRangeFirst && requestedRangeLast < static_cast<int>(viewer.prepared.animation.frames.size())) {
+                viewer.useRange = true; viewer.rangeFirst = requestedRangeFirst; viewer.rangeLast = requestedRangeLast; viewer.frame = requestedRangeFirst;
+            }
+            if (requestedAssetBatch) viewer.selectedAnimations.assign(viewer.resource.animations.size(), true);
+            if (requestedAssetBlock >= 0) { atlas_ui::loadStageAssetSheet(viewer, app.mods[app.selectedMod]->catalog.vfs()); viewer.selectedRectangle = requestedAssetBlock; }
+        }
+    }
     if (!requestedQuick.empty()) {
         const bool stageOnly = requestedQuick.rfind("stage:", 0) == 0;
         const bool characterOnly = requestedQuick.rfind("character:", 0) == 0;
@@ -4537,8 +5589,11 @@ int main(int argc, char** argv) {
         songLabScan(app);
         for (size_t i = 0; i < app.songLab.songs.size(); ++i) {
             const SongLabEntry& entry = app.songLab.songs[i];
+            if (!requestedSongSource.empty() &&
+                lower(entry.path).find(requestedSongSource) == std::string::npos) continue;
             const std::string folder = fs::u8path(entry.path).parent_path().filename().u8string();
-            if (lower(entry.id + ":" + entry.difficulty) == requestedSong ||
+            if (lower(entry.id + ":" + entry.difficulty + ":" + entry.variation) == requestedSong ||
+                lower(entry.id + ":" + entry.difficulty) == requestedSong ||
                 lower(folder + ":" + entry.difficulty) == requestedSong ||
                 lower(fs::u8path(entry.path).stem().u8string()) == requestedSong) {
                 songLabLoad(app, static_cast<int>(i));
@@ -4551,8 +5606,20 @@ int main(int argc, char** argv) {
             std::fprintf(stdout, "Song Lab chart: %s, %zu notes, %s\n",
                 app.songLab.chart.songId.c_str(), app.songLab.chart.notes.size(),
                 app.songLab.status.c_str());
+        if (app.songLab.selected >= 0)
+            std::fprintf(stdout, "Song Lab source: %s\n",
+                app.songLab.activeSong.path.c_str());
         for (const std::string& path : app.songLab.audioPaths)
             std::fprintf(stdout, "Song Lab audio: %s\n", path.c_str());
+        std::fprintf(stdout, "Song Lab script audio: %s, %zu scripts, %zu cues, %zu skipped\n",
+            app.songLab.applyScriptAudio ? "on" : "off", app.songLab.scriptPaths.size(),
+            app.songLab.scriptAudioCues.size(), app.songLab.scriptAudioIssues.size());
+        for (const SongScriptAudioCue& cue : app.songLab.scriptAudioCues)
+            std::fprintf(stdout, "Song Lab script cue: %.1f ms, %s, %.2f, %s:%d\n",
+                cue.timeMs,
+                cue.target == SongScriptAudioTarget::Instrumental ? "inst" :
+                cue.target == SongScriptAudioTarget::Vocals ? "voices" : "strumline",
+                cue.gain, cue.source.c_str(), cue.line);
         if (!app.songLab.audioWarning.empty())
             std::fprintf(stdout, "Song Lab warning: %s\n", app.songLab.audioWarning.c_str());
     }
@@ -4648,14 +5715,20 @@ int main(int argc, char** argv) {
     bool running = true;
     int exitCode = 0;
     if (!requestedExport.empty()) {
-        const bool allowed = requestedExport == "psych" || requestedExport == "codename" ||
+        const bool allowed = requestedExport == "psych" || requestedExport == "codename" || requestedExport == "original" || requestedExport == "batch" ||
+                             requestedExport == "assetpng" || requestedExport == "assetgif" ||
+                             requestedExport == "assetsheet" || requestedExport == "assetzip" || requestedExport == "assetblock" || requestedExport == "assetbatch" ||
                              requestedExport == "vslice" ||
                              requestedExport == "previewgif" || requestedExport == "pairgifs" ||
                              requestedExport == "stagezip" || requestedExport == "stagegif" ||
                              requestedExport == "stagesheet" || requestedExport == "objectpng" ||
                              requestedExport == "stagepng" || requestedExport == "stagescenegif";
-        const bool ok = !requestedExportDir.empty() && selectedAsset(app) && allowed &&
-            (requestedExport == "previewgif" ? exportCharacterPreviewGif(app, requestedExportDir) :
+        bool ok = false;
+        try {
+        ok = !requestedExportDir.empty() && selectedAsset(app) && allowed &&
+            (requestedExport == "batch" ? [&]() { beginExportQueue(app, requestedExportDir); while (app.exportQueue.running) tickExportQueue(app); return !app.exportQueue.jobs.empty() && std::all_of(app.exportQueue.jobs.begin(), app.exportQueue.jobs.end(), [](const ExportJob& job) { return job.done && job.success; }); }() :
+             requestedExport == "original" ? exportReference(app, resourceReference(app, app.selectedMod, app.selectedAsset), 0, requestedExportDir) :
+             requestedExport == "previewgif" ? exportCharacterPreviewGif(app, requestedExportDir) :
              requestedExport == "pairgifs" ? [&]() {
                  if (app.secondaryAssetIndex < 0) return false;
                  const bool first = exportCharacterAnimation(app, DialogAction::AnimationGif, requestedExportDir);
@@ -4664,58 +5737,110 @@ int main(int argc, char** argv) {
                  switchActiveCharacter(app);
                  return first && second;
              }() :
+             requestedExport == "asset-invalid" ? false :
+             requestedExport == "assetpng" ? exportAdvancedStageAsset(app, DialogAction::AssetPosePng, requestedExportDir) :
+             requestedExport == "assetgif" ? exportAdvancedStageAsset(app, DialogAction::AssetAnimationGif, requestedExportDir) :
+             requestedExport == "assetsheet" ? exportAdvancedStageAsset(app, DialogAction::AssetMountedSheet, requestedExportDir) :
+             requestedExport == "assetblock" ? exportAdvancedStageAsset(app, DialogAction::AssetBlockPng, requestedExportDir) :
+             requestedExport == "assetbatch" ? exportAdvancedStageAsset(app, DialogAction::AssetAnimationBatch, requestedExportDir) :
+             requestedExport == "assetzip" ? exportAdvancedStageAsset(app, DialogAction::AssetSourceZip, requestedExportDir) :
              requestedExport == "stagezip" ? exportStageZip(app, requestedExportDir) :
              requestedExport == "stagegif" ? exportStageGif(app, requestedExportDir) :
              requestedExport == "stagesheet" ? exportStageSheet(app, requestedExportDir) :
              requestedExport == "objectpng" ? exportStageObjectPng(app, requestedExportDir) :
              requestedExport == "stagepng" ? exportStageScenePng(app, requestedExportDir) :
              requestedExport == "stagescenegif" ? exportStageSceneGif(app, requestedExportDir) :
-             requestedExport == "vslice" ? exportVSlice(app, requestedExportDir) :
-             exportEngine(app, requestedExportDir, requestedExport == "psych"));
+             requestedExport == "vslice" ? exportReference(app, resourceReference(app, app.selectedMod, app.selectedAsset), 1, requestedExportDir) :
+             exportReference(app, resourceReference(app, app.selectedMod, app.selectedAsset), requestedExport == "psych" ? 2 : 3, requestedExportDir));
+        } catch (const std::exception& error) {
+            ok = false;
+            const std::string detail = ensureUtf8(error.what());
+            setStatus(app, "La exportación falló: " + detail, "Export failed: " + detail);
+        }
         std::fprintf(ok ? stdout : stderr, "%s\n", statusText(app).c_str());
         running = false;
         exitCode = ok ? 0 : 4;
     }
     int frameCount = 0;
+    bool wheelCheckPushed = false;
+    float wheelCheckStartZoom = 0.0f;
+    bool assetWheelCheckPushed = false;
+    float assetWheelStartZoom = 0.0f;
+    const float assetStageStartZoom = app.previewZoom;
+    for (const auto& path : requestedDrops) {
+        SDL_Event event{}; event.type = SDL_EVENT_DROP_FILE; event.drop.data = path.c_str(); event.drop.windowID = SDL_GetWindowID(window);
+        SDL_PushEvent(&event);
+    }
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_EVENT_DROP_BEGIN) app.dropActive = true;
+            if (event.type == SDL_EVENT_DROP_FILE && event.drop.data && app.droppedPaths.size() < 32) app.droppedPaths.emplace_back(event.drop.data);
+            if (event.type == SDL_EVENT_DROP_COMPLETE) app.dropActive = false;
+            ImVec2 wheelPosition{};
+            if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+                wheelPosition = ImVec2(event.wheel.mouse_x, event.wheel.mouse_y);
+                if (SDL_Window* source = SDL_GetWindowFromID(event.wheel.windowID)) {
+                    int windowX = 0, windowY = 0;
+                    SDL_GetWindowPosition(source, &windowX, &windowY);
+                    wheelPosition.x += static_cast<float>(windowX);
+                    wheelPosition.y += static_cast<float>(windowY);
+                }
+            }
+            bool assetWheel = false;
+            if (app.comparison.open && event.type == SDL_EVENT_MOUSE_WHEEL && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+                auto& view = app.comparison.canvas;
+                if (view.boundsValid && event.wheel.windowID == view.window && wheelPosition.x >= view.min.x && wheelPosition.x < view.max.x && wheelPosition.y >= view.min.y && wheelPosition.y < view.max.y && event.wheel.y != 0) {
+                    view.wheel += event.wheel.y; view.wheelPosition = wheelPosition; assetWheel = true;
+                }
+            }
+            if (!assetWheel && app.assetViewer.open && event.type == SDL_EVENT_MOUSE_WHEEL &&
+                !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+                for (atlas_ui::AssetCanvasView* view : {&app.assetViewer.poseView, &app.assetViewer.sheetView}) {
+                    if (!view->boundsValid || event.wheel.windowID != view->window ||
+                        wheelPosition.x < view->min.x || wheelPosition.x >= view->max.x ||
+                        wheelPosition.y < view->min.y || wheelPosition.y >= view->max.y || event.wheel.y == 0) continue;
+                    view->wheel += event.wheel.y; view->wheelPosition = wheelPosition;
+                    assetWheel = true; break;
+                }
+            }
+            if (assetWheel) continue;
             if (event.type == SDL_EVENT_MOUSE_WHEEL && app.previewBoundsValid &&
                 !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
-                event.wheel.windowID == SDL_GetWindowID(window) &&
-                event.wheel.mouse_x >= app.previewBoundsMin.x &&
-                event.wheel.mouse_x < app.previewBoundsMax.x &&
-                event.wheel.mouse_y >= app.previewBoundsMin.y &&
-                event.wheel.mouse_y < app.previewBoundsMax.y &&
+                event.wheel.windowID == app.previewWindowId &&
+                wheelPosition.x >= app.previewBoundsMin.x &&
+                wheelPosition.x < app.previewBoundsMax.x &&
+                wheelPosition.y >= app.previewBoundsMin.y &&
+                wheelPosition.y < app.previewBoundsMax.y &&
                 event.wheel.y != 0.0f) {
                 app.previewWheel += event.wheel.y;
-                app.previewWheelPos = ImVec2(event.wheel.mouse_x, event.wheel.mouse_y);
+                app.previewWheelPos = wheelPosition;
                 continue;
             }
             if (event.type == SDL_EVENT_MOUSE_WHEEL && app.sheetBoundsValid &&
                 !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) &&
-                event.wheel.windowID == SDL_GetWindowID(window) &&
-                event.wheel.mouse_x >= app.sheetBoundsMin.x &&
-                event.wheel.mouse_x < app.sheetBoundsMax.x &&
-                event.wheel.mouse_y >= app.sheetBoundsMin.y &&
-                event.wheel.mouse_y < app.sheetBoundsMax.y &&
+                event.wheel.windowID == app.sheetWindowId &&
+                wheelPosition.x >= app.sheetBoundsMin.x &&
+                wheelPosition.x < app.sheetBoundsMax.x &&
+                wheelPosition.y >= app.sheetBoundsMin.y &&
+                wheelPosition.y < app.sheetBoundsMax.y &&
                 event.wheel.y != 0.0f) {
                 app.sheetWheel += event.wheel.y;
-                app.sheetWheelPos = ImVec2(event.wheel.mouse_x, event.wheel.mouse_y);
+                app.sheetWheelPos = wheelPosition;
                 continue;
             }
             bool liveSheetWheel = false;
             for (LiveSheetViewState& sheet : app.liveSheetViews) {
                 if (event.type != SDL_EVENT_MOUSE_WHEEL || !sheet.boundsValid ||
                     ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) ||
-                    event.wheel.windowID != SDL_GetWindowID(window) ||
-                    event.wheel.mouse_x < sheet.boundsMin.x ||
-                    event.wheel.mouse_x >= sheet.boundsMax.x ||
-                    event.wheel.mouse_y < sheet.boundsMin.y ||
-                    event.wheel.mouse_y >= sheet.boundsMax.y ||
+                    event.wheel.windowID != sheet.windowId ||
+                    wheelPosition.x < sheet.boundsMin.x ||
+                    wheelPosition.x >= sheet.boundsMax.x ||
+                    wheelPosition.y < sheet.boundsMin.y ||
+                    wheelPosition.y >= sheet.boundsMax.y ||
                     event.wheel.y == 0.0f) continue;
                 sheet.wheel += event.wheel.y;
-                sheet.wheelPos = ImVec2(event.wheel.mouse_x, event.wheel.mouse_y);
+                sheet.wheelPos = wheelPosition;
                 liveSheetWheel = true;
                 break;
             }
@@ -4728,32 +5853,110 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        draw(app, window);
-        drawQuickPreview(app);
+        // Una excepcion a mitad del fotograma (leer un recurso roto, un
+        // filesystem_error) cerraba Atlas. Se deshacen las ventanas e IDs que
+        // quedaron abiertos y se sigue con el siguiente fotograma.
+        ImGuiErrorRecoveryState frameRecovery;
+        ImGui::ErrorRecoveryStoreState(&frameRecovery);
+        try {
+            draw(app, window);
+            drawQuickPreview(app);
+        } catch (const std::exception& error) {
+            ImGui::ErrorRecoveryTryToRecoverState(&frameRecovery);
+            const std::string detail = ensureUtf8(error.what());
+            setStatus(app, "Error al dibujar (Atlas sigue abierto): " + detail,
+                           "Drawing error (Atlas is still open): " + detail);
+        } catch (...) {
+            ImGui::ErrorRecoveryTryToRecoverState(&frameRecovery);
+            setStatus(app, "Error al dibujar (Atlas sigue abierto).",
+                           "Drawing error (Atlas is still open).");
+        }
         ImGui::Render();
+        SDL_GL_MakeCurrent(window, context);
         int width = 0, height = 0;
         SDL_GetWindowSizeInPixels(window, &width, &height);
         glViewport(0, 0, width, height);
         glClearColor(0.065f, 0.071f, 0.080f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        if (requestedWheelCheck && !wheelCheckPushed && app.previewBoundsValid) {
+            SDL_Window* previewWindow = SDL_GetWindowFromID(app.previewWindowId);
+            if (previewWindow) {
+                int windowX = 0, windowY = 0;
+                SDL_GetWindowPosition(previewWindow, &windowX, &windowY);
+                SDL_Event wheelEvent{};
+                wheelEvent.type = SDL_EVENT_MOUSE_WHEEL;
+                wheelEvent.wheel.windowID = app.previewWindowId;
+                wheelEvent.wheel.mouse_x = (app.previewBoundsMin.x + app.previewBoundsMax.x) * 0.5f - windowX;
+                wheelEvent.wheel.mouse_y = (app.previewBoundsMin.y + app.previewBoundsMax.y) * 0.5f - windowY;
+                wheelEvent.wheel.y = 1.0f;
+                wheelCheckStartZoom = app.previewZoom;
+                wheelCheckPushed = SDL_PushEvent(&wheelEvent);
+            }
+        }
+        if (requestedAssetWheelCheck && !assetWheelCheckPushed) {
+            auto& view = requestedAssetSheet ? app.assetViewer.sheetView : app.assetViewer.poseView;
+            if (view.boundsValid) {
+                if (SDL_Window* assetWindow = SDL_GetWindowFromID(view.window)) {
+                    int windowX = 0, windowY = 0; SDL_GetWindowPosition(assetWindow, &windowX, &windowY);
+                    SDL_Event wheelEvent{};
+                    wheelEvent.type = SDL_EVENT_MOUSE_WHEEL; wheelEvent.wheel.windowID = view.window;
+                    wheelEvent.wheel.mouse_x = (view.min.x + view.max.x) * 0.5f - windowX;
+                    wheelEvent.wheel.mouse_y = (view.min.y + view.max.y) * 0.5f - windowY;
+                    wheelEvent.wheel.y = 1;
+                    assetWheelStartZoom = view.zoom;
+                    assetWheelCheckPushed = SDL_PushEvent(&wheelEvent);
+                }
+            }
+        }
         if (!app.capturePath.empty() && ++frameCount >= captureFrames) {
             std::vector<unsigned char> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
             stbi_flip_vertically_on_write(1);
-            stbi_write_png(app.capturePath.c_str(), width, height, 4, pixels.data(), width * 4);
+            writePngFile(pathFromUtf8(app.capturePath), width, height, pixels.data());
             stbi_flip_vertically_on_write(0);
+            if (requestedWheelCheck) {
+                const bool passed = wheelCheckPushed && app.previewZoom > wheelCheckStartZoom * 1.05f;
+                std::fprintf(passed ? stdout : stderr, "Preview wheel: %s, window %u, zoom %.3f -> %.3f\n",
+                             passed ? "OK" : "FAILED", app.previewWindowId,
+                             wheelCheckStartZoom, app.previewZoom);
+                if (!passed) exitCode = 5;
+            }
+            if (requestedAssetWheelCheck) {
+                const auto& view = requestedAssetSheet ? app.assetViewer.sheetView : app.assetViewer.poseView;
+                const bool passed = assetWheelCheckPushed && view.zoom > assetWheelStartZoom * 1.05f && app.previewZoom == assetStageStartZoom;
+                std::fprintf(passed ? stdout : stderr, "Asset wheel isolation: %s, zoom %.3f -> %.3f, stage %.3f\n",
+                    passed ? "OK" : "FAILED", assetWheelStartZoom, view.zoom, app.previewZoom);
+                if (!passed) exitCode = 6;
+            }
+            if (app.songLab.audioLoaded) {
+                std::fprintf(stdout, "Song Lab time: %.1f / %.1f ms\n",
+                    app.songLab.audio.positionMs(), app.songLab.audio.durationMs());
+                for (size_t i = 0; i < app.songLab.audio.trackCount(); ++i)
+                    std::fprintf(stdout, "Song Lab track gain: %zu %.3f\n", i,
+                        app.songLab.audio.trackGain(i));
+            }
+            if (!requestedDrops.empty()) std::fprintf(stdout, "Drag & drop: %zu sources loaded\n", app.mods.size());
             running = false;
+        }
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+            SDL_Window* previousWindow = SDL_GL_GetCurrentWindow();
+            SDL_GLContext previousContext = SDL_GL_GetCurrentContext();
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+            SDL_GL_MakeCurrent(previousWindow, previousContext);
         }
         SDL_GL_SwapWindow(window);
     }
     if (app.capturePath.empty() && requestedExport.empty()) saveGallery(app);
     if (app.stagePoseTexture) glDeleteTextures(1, &app.stagePoseTexture);
+    app.assetViewer.releaseTextures();
     for (MountedViewCache& mounted : app.mountedViews)
         if (mounted.texture) glDeleteTextures(1, &mounted.texture);
     if (app.quickRenderMod >= 0) app.quickRenderer.shutdown();
     if (app.rendererReady) app.renderer.shutdown();
+    closeComparison(app);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

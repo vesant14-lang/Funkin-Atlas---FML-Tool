@@ -1,5 +1,24 @@
 #pragma once
 
+std::string characterSheetImage(AtlasApp& app, const UniversalCharacter& character) {
+    std::vector<std::string> pages = character.resolvedImages;
+    if (AtlasStore::isAnimatePath(character.resolvedAtlas))
+        if (const AnimateAtlas* atlas = app.atlases.getAnimate(character.resolvedAtlas)) pages = atlas->imagePaths();
+    if (pages.empty()) pages.push_back(character.resolvedImage);
+    const std::string key = app.mods[static_cast<size_t>(app.selectedMod)]->catalog.root().u8string() + "|" + character.sourcePath;
+    int& selected = app.characterSheetPages[key];
+    selected = std::clamp(selected, 0, static_cast<int>(pages.size()) - 1);
+    if (pages.size() > 1) {
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo(app.spanish ? "Página##character-sheet-page" : "Page##character-sheet-page", pages[static_cast<size_t>(selected)].c_str())) {
+            for (size_t page = 0; page < pages.size(); ++page)
+                if (ImGui::Selectable(pages[page].c_str(), selected == static_cast<int>(page))) selected = static_cast<int>(page);
+            ImGui::EndCombo();
+        }
+    }
+    return pages[static_cast<size_t>(selected)];
+}
+
 int frameCountFor(AtlasApp& app, const AnimationDef& animation) {
     const std::string& atlasPath = app.previewCharacter.resolvedAtlas;
     if (AtlasStore::isAnimatePath(atlasPath)) {
@@ -7,7 +26,7 @@ int frameCountFor(AtlasApp& app, const AnimationDef& animation) {
         return !animation.indices.empty() ? static_cast<int>(animation.indices.size())
              : atlas ? atlas->frameCount(animation.atlasPrefix) : 0;
     }
-    const SparrowAtlas* atlas = app.atlases.get(atlasPath);
+    const SparrowAtlas* atlas = app.atlases.getCharacter(app.previewCharacter);
     if (!atlas) return 0;
     if (!animation.indices.empty()) return static_cast<int>(animation.indices.size());
     return animation.allAtlasFrames ? static_cast<int>(atlas->frames.size())
@@ -36,7 +55,7 @@ void refreshPreviewCharacter(AtlasApp& app) {
     int firstManual = 0;
     if (!app.tracedFrames.empty() && !AtlasStore::isAnimatePath(app.previewCharacter.resolvedAtlas)) {
         SparrowAtlas combined;
-        if (const SparrowAtlas* original = app.atlases.get(app.previewCharacter.resolvedAtlas))
+        if (const SparrowAtlas* original = app.atlases.getCharacter(app.previewCharacter))
             combined = *original;
         firstManual = static_cast<int>(combined.frames.size());
         for (size_t index = 0; index < app.tracedFrames.size(); ++index) {
@@ -49,7 +68,7 @@ void refreshPreviewCharacter(AtlasApp& app) {
         app.previewCharacter.resolvedAtlas = manualPath;
     }
     const SparrowAtlas* sourceAtlas = AtlasStore::isAnimatePath(app.previewCharacter.resolvedAtlas)
-        ? nullptr : app.atlases.get(app.previewCharacter.resolvedAtlas);
+        ? nullptr : app.atlases.getCharacter(app.previewCharacter);
     const UniversalCharacter& original = std::get<UniversalCharacter>(asset->parsed);
     const auto& authored = asset->previewAnimations.empty() ? original.anims : asset->previewAnimations;
     const AnimationDef* animateSource = AtlasStore::isAnimatePath(app.previewCharacter.resolvedAtlas) &&
@@ -132,16 +151,15 @@ bool prepareCharacterExport(AtlasApp& app, bool sequence,
         return false;
     }
     const auto& vfs = app.mods[static_cast<size_t>(app.selectedMod)]->catalog.vfs();
-    const auto encoded = vfs.readBytes(app.previewCharacter.resolvedImage, 128u * 1024u * 1024u);
-    if (!encoded) {
-        setStatus(app, "No se pudo leer el spritesheet.", "Could not read the spritesheet.");
+    const auto source = prepareCharacterVisual(vfs, app.previewCharacter,
+        AtlasStore::isAnimatePath(app.previewCharacter.resolvedAtlas) ? nullptr : app.atlases.getCharacter(app.previewCharacter));
+    if (!source.error.empty()) {
+        setStatus(app, "No se pudo preparar el recurso: " + source.error, "Could not prepare visual source: " + source.error);
         return false;
     }
-    const SparrowAtlas* sparrow = nullptr;
-    const AnimateAtlas* animate = nullptr;
-    if (AtlasStore::isAnimatePath(app.previewCharacter.resolvedAtlas))
-        animate = app.atlases.getAnimate(app.previewCharacter.resolvedAtlas);
-    else sparrow = app.atlases.get(app.previewCharacter.resolvedAtlas);
+    const auto& encoded = source.isAnimate ? source.animate.encodedImage : source.encodedImage;
+    const SparrowAtlas* sparrow = source.isAnimate ? nullptr : &source.sparrow;
+    const AnimateAtlas* animate = source.isAnimate ? &source.animate.atlas : nullptr;
     definition = app.previewCharacter.anims[static_cast<size_t>(app.animationIndex)];
     if (sequence && !app.sequence.empty()) {
         std::vector<AnimationSequenceStep> steps;
@@ -150,10 +168,10 @@ bool prepareCharacterExport(AtlasApp& app, bool sequence,
             steps.push_back({app.previewCharacter.anims[static_cast<size_t>(step.animation)],
                              std::clamp(step.repeat, 1, 64)});
         }
-        result = prepareMountedAnimationSequenceGif(*encoded, steps, sparrow, animate,
+        result = prepareMountedAnimationSequenceGif(encoded, steps, sparrow, animate,
             app.previewCharacter.flipX, app.flipY, app.loopPreview);
     } else {
-        result = prepareMountedAnimationGif(*encoded, definition, sparrow, animate,
+        result = prepareMountedAnimationGif(encoded, definition, sparrow, animate,
             app.previewCharacter.flipX, app.flipY, app.loopPreview);
     }
     if (!result.ok) {
@@ -241,18 +259,16 @@ bool ensureMountedView(AtlasApp& app, const UniversalCharacter& character,
         std::to_string(character.flipX) + "|" + std::to_string(animation.flipX) + "|" +
         std::to_string(animation.flipY);
     for (int index : animation.indices) key += "," + std::to_string(index);
+    for (const auto& path : character.resolvedImages) key += "|image:" + path;
+    for (const auto& path : character.resolvedAtlases) key += "|atlas:" + path;
     if (cache.key == key) return cache.error.empty() && cache.texture != 0;
     cache.key = std::move(key);
     cache.error.clear();
     cache.width = cache.height = cache.frameWidth = cache.frameHeight = cache.frameCount = 0;
     const Vfs& vfs = app.mods[static_cast<size_t>(app.selectedMod)]->catalog.vfs();
-    const auto encoded = vfs.readBytes(character.resolvedImage, 128u * 1024u * 1024u);
-    if (!encoded) { cache.error = "Could not read the spritesheet"; return false; }
-    const bool isAnimate = AtlasStore::isAnimatePath(character.resolvedAtlas);
-    const SparrowAtlas* sparrow = isAnimate ? nullptr : app.atlases.get(character.resolvedAtlas);
-    const AnimateAtlas* animate = isAnimate ? app.atlases.getAnimate(character.resolvedAtlas) : nullptr;
-    GifPrepareResult prepared = prepareMountedAnimationGif(*encoded, animation, sparrow, animate,
-        character.flipX, false, true);
+    const auto source = prepareCharacterVisual(vfs, character,
+        AtlasStore::isAnimatePath(character.resolvedAtlas) ? nullptr : app.atlases.getCharacter(character));
+    GifPrepareResult prepared = prepareCharacterVisualAnimation(source, animation, character.flipX, false, true);
     if (!prepared.ok) { cache.error = prepared.error; return false; }
     MountedSheet sheet;
     if (!packMountedSheet(prepared, animation, sheet, cache.error)) return false;
@@ -283,7 +299,8 @@ bool ensureMountedView(AtlasApp& app, const UniversalCharacter& character,
 void drawSpriteSheet(AtlasApp& app) {
     const auto& character = app.previewCharacter;
     if (character.resolvedImage.empty() || !app.rendererReady) return;
-    const auto image = app.renderer.previewImage(character.resolvedImage);
+    const std::string pageImage = characterSheetImage(app, character);
+    const auto image = app.renderer.previewImage(pageImage);
     if (!image.ok || image.width <= 0 || image.height <= 0) return;
     ImGui::SetNextItemWidth(170.0f);
     ImGui::SliderFloat(app.spanish ? "Zoom de hoja" : "Sheet zoom", &app.sheetZoom, 0.2f, 32.0f, "%.2fx");
@@ -323,20 +340,24 @@ void drawSpriteSheet(AtlasApp& app) {
     const ModExplorerAsset* asset = selectedAsset(app);
     const auto& original = std::get<UniversalCharacter>(asset->parsed);
     const SparrowAtlas* atlas = AtlasStore::isAnimatePath(original.resolvedAtlas)
-        ? nullptr : app.atlases.get(original.resolvedAtlas);
+        ? nullptr : app.atlases.getCharacter(original);
     ImDrawList* draw = ImGui::GetWindowDrawList();
     if (atlas && app.frameGeometry) {
-        for (const AtlasFrame& frame : atlas->frames)
+        for (const AtlasFrame& frame : atlas->frames) {
+            if (!frame.sourceImage.empty() && frame.sourceImage != pageImage) continue;
             draw->AddRect(ImVec2(origin.x + frame.x * scale, origin.y + frame.y * scale),
                           ImVec2(origin.x + (frame.x + frame.w) * scale,
                                  origin.y + (frame.y + frame.h) * scale),
                           IM_COL32(232, 183, 107, 170));
+        }
     }
-    for (const AtlasFrame& frame : app.tracedFrames)
+    for (const AtlasFrame& frame : app.tracedFrames) {
+        if (!frame.sourceImage.empty() && frame.sourceImage != pageImage) continue;
         draw->AddRect(ImVec2(origin.x + frame.x * scale, origin.y + frame.y * scale),
                       ImVec2(origin.x + (frame.x + frame.w) * scale,
                              origin.y + (frame.y + frame.h) * scale),
                       IM_COL32(111, 205, 159, 255), 0.0f, 0, 2.0f);
+    }
     for (size_t order = 0; order < app.manualOrder.size(); ++order) {
         const CustomPose& pose = app.manualOrder[order];
         const AtlasFrame* frame = pose.traced
@@ -345,6 +366,7 @@ void drawSpriteSheet(AtlasApp& app) {
             : (atlas && pose.index >= 0 && pose.index < static_cast<int>(atlas->frames.size())
                 ? &atlas->frames[static_cast<size_t>(pose.index)] : nullptr);
         if (!frame) continue;
+        if (!frame->sourceImage.empty() && frame->sourceImage != pageImage) continue;
         const ImU32 color = static_cast<int>(order) == app.selectedPoseIndex
             ? IM_COL32(255, 226, 105, 255) : IM_COL32(107, 229, 171, 220);
         const ImVec2 corner(origin.x + frame->x * scale, origin.y + frame->y * scale);
@@ -391,6 +413,7 @@ void drawSpriteSheet(AtlasApp& app) {
             app.tracing = false;
             if (x1 - x0 >= 2.0f && y1 - y0 >= 2.0f && app.tracedFrames.size() < 512u) {
                 AtlasFrame frame;
+                frame.sourceImage = pageImage;
                 frame.x = static_cast<int>(x0); frame.y = static_cast<int>(y0);
                 frame.w = static_cast<int>(x1 - x0); frame.h = static_cast<int>(y1 - y0);
                 frame.frameW = frame.w; frame.frameH = frame.h;
@@ -405,6 +428,7 @@ void drawSpriteSheet(AtlasApp& app) {
     } else if (atlas && app.pickFrames && hovered && app.manualOrder.size() < 512u && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         for (size_t i = 0; i < atlas->frames.size(); ++i) {
             const AtlasFrame& frame = atlas->frames[i];
+            if (!frame.sourceImage.empty() && frame.sourceImage != pageImage) continue;
             if (sx < frame.x || sx >= frame.x + frame.w || sy < frame.y || sy >= frame.y + frame.h) continue;
             app.customFrames.push_back(static_cast<int>(i));
             app.manualOrder.push_back({false, static_cast<int>(i)});
@@ -423,6 +447,7 @@ void drawSpriteSheet(AtlasApp& app) {
     app.sheetBoundsMin = ImGui::GetItemRectMin();
     app.sheetBoundsMax = ImGui::GetItemRectMax();
     app.sheetBoundsValid = true;
+    app.sheetWindowId = atlasCurrentWindowId();
     app.sheetWheel = 0.0f;
 }
 void appendLiveSheetFrame(AtlasApp& app, int slot, bool mounted,
@@ -452,7 +477,7 @@ void appendLiveSheetFrame(AtlasApp& app, int slot, bool mounted,
             app.manualOrder.push_back({false, index});
         }
     } else if (valid) {
-        const SparrowAtlas* atlas = app.atlases.get(app.previewCharacter.resolvedAtlas);
+        const SparrowAtlas* atlas = app.atlases.getCharacter(app.previewCharacter);
         valid = atlas && index < static_cast<int>(atlas->frames.size());
         if (valid) {
             const bool manual = app.previewCharacter.resolvedAtlas.rfind("atlas-manual:", 0) == 0;
@@ -490,7 +515,9 @@ void drawLiveSheetCanvas(AtlasApp& app, int slot, unsigned int texture,
         state.pan = ImVec2(0.0f, 0.0f);
     }
     const bool selected = state.selected >= 0 &&
-        state.selected < static_cast<int>(selectable.size());
+        state.selected < static_cast<int>(selectable.size()) &&
+        (selectable[static_cast<size_t>(state.selected)].sourceImage.empty() ||
+         selectable[static_cast<size_t>(state.selected)].sourceImage == state.image);
     if (selected)
         ImGui::TextDisabled("%s: %d · %s", app.spanish ? "Cuadro" : "Frame",
             state.selected + 1, selectable[static_cast<size_t>(state.selected)].name.c_str());
@@ -508,6 +535,7 @@ void drawLiveSheetCanvas(AtlasApp& app, int slot, unsigned int texture,
     state.boundsMin = canvasMin;
     state.boundsMax = canvasMax;
     state.boundsValid = true;
+    state.windowId = atlasCurrentWindowId();
     const bool hovered = ImGui::IsItemHovered();
     const ImVec2 center((canvasMin.x + canvasMax.x) * 0.5f,
                         (canvasMin.y + canvasMax.y) * 0.5f);
@@ -538,6 +566,7 @@ void drawLiveSheetCanvas(AtlasApp& app, int slot, unsigned int texture,
         ImVec2(cropX / textureWidth, cropY / textureHeight),
         ImVec2((cropX + cropWidth) / textureWidth, (cropY + cropHeight) / textureHeight));
     auto outline = [&](const AtlasFrame& region, ImU32 color, float thickness) {
+        if (!region.sourceImage.empty() && region.sourceImage != state.image) return;
         draw->AddRect(ImVec2(origin.x + (region.x - cropX) * scale,
                              origin.y + (region.y - cropY) * scale),
                       ImVec2(origin.x + (region.x + region.w - cropX) * scale,
@@ -561,6 +590,7 @@ void drawLiveSheetCanvas(AtlasApp& app, int slot, unsigned int texture,
         float area = std::numeric_limits<float>::max();
         for (size_t i = 0; i < selectable.size(); ++i) {
             const AtlasFrame& region = selectable[i];
+            if (!region.sourceImage.empty() && region.sourceImage != state.image) continue;
             if (x < region.x || x >= region.x + region.w ||
                 y < region.y || y >= region.y + region.h) continue;
             const float candidate = static_cast<float>(region.w) * region.h;
@@ -623,8 +653,11 @@ void drawActiveSpriteSheet(AtlasApp& app, const UniversalCharacter& character,
         ImGui::EndChild();
         return;
     }
-    const auto image = character.resolvedImage.empty() || !app.rendererReady
-        ? GlRenderer::PreviewImage{} : app.renderer.previewImage(character.resolvedImage);
+    const std::string pageImage = characterSheetImage(app, character);
+    const int slot = markerIndex == app.characterMarkerIndex ? 0 : 1;
+    app.liveSheetViews[slot].image = pageImage;
+    const auto image = pageImage.empty() || !app.rendererReady
+        ? GlRenderer::PreviewImage{} : app.renderer.previewImage(pageImage);
     if (!image.ok || image.width <= 0 || image.height <= 0) {
         ImGui::TextDisabled("%s", app.spanish ? "Hoja no disponible" : "Sheet unavailable");
         ImGui::EndChild();
@@ -644,13 +677,14 @@ void drawActiveSpriteSheet(AtlasApp& app, const UniversalCharacter& character,
                 for (const AnimateElement& element : elements) {
                     if (!element.sprite) continue;
                     AtlasFrame region;
+                    region.sourceImage = element.sprite->sourceImage;
                     region.name = element.sprite->name;
                     region.x = element.sprite->x; region.y = element.sprite->y;
                     region.w = element.sprite->w; region.h = element.sprite->h;
                     regions.push_back(std::move(region));
                 }
             }
-        } else if (const SparrowAtlas* atlas = app.atlases.get(character.resolvedAtlas)) {
+        } else if (const SparrowAtlas* atlas = app.atlases.getCharacter(character)) {
             std::vector<size_t> frames;
             if (animation.allAtlasFrames) {
                 frames.resize(atlas->frames.size());
@@ -662,6 +696,9 @@ void drawActiveSpriteSheet(AtlasApp& app, const UniversalCharacter& character,
     }
     float cropX = 0.0f, cropY = 0.0f;
     float cropW = static_cast<float>(image.width), cropH = static_cast<float>(image.height);
+    regions.erase(std::remove_if(regions.begin(), regions.end(), [&](const AtlasFrame& region) {
+        return !region.sourceImage.empty() && region.sourceImage != pageImage;
+    }), regions.end());
     if (app.followActiveSheet && !regions.empty()) {
         float left = static_cast<float>(regions.front().x);
         float top = static_cast<float>(regions.front().y);
@@ -682,7 +719,7 @@ void drawActiveSpriteSheet(AtlasApp& app, const UniversalCharacter& character,
     std::vector<AtlasFrame> frames;
     bool canAppend = false;
     if (!isAnimate) {
-        if (const SparrowAtlas* atlas = app.atlases.get(character.resolvedAtlas)) {
+        if (const SparrowAtlas* atlas = app.atlases.getCharacter(character)) {
             frames = atlas->frames;
             canAppend = !frames.empty();
         }
@@ -694,7 +731,6 @@ void drawActiveSpriteSheet(AtlasApp& app, const UniversalCharacter& character,
         whole.h = image.height;
         frames.push_back(std::move(whole));
     }
-    const int slot = markerIndex == app.characterMarkerIndex ? 0 : 1;
     drawLiveSheetCanvas(app, slot, image.texture, image.width, image.height,
         cropX, cropY, cropW, cropH, frames, regions, canAppend, false, running);
     ImGui::EndChild();
@@ -788,6 +824,7 @@ void drawAnimateMountedEditor(AtlasApp& app, const std::vector<AnimationDef>& au
     app.sheetBoundsMin = ImGui::GetItemRectMin();
     app.sheetBoundsMax = ImGui::GetItemRectMax();
     app.sheetBoundsValid = true;
+    app.sheetWindowId = atlasCurrentWindowId();
     app.sheetWheel = 0.0f;
 }
 
@@ -962,7 +999,7 @@ void drawCharacterTools(AtlasApp& app, SDL_Window* window) {
                 ImGui::BeginChild("##pose-order", ImVec2(0.0f, 150.0f), true);
                 for (size_t i = 0; i < app.manualOrder.size(); ++i) {
                     const CustomPose& pose = app.manualOrder[i];
-                    const SparrowAtlas* atlas = app.atlases.get(sourceCharacter.resolvedAtlas);
+                    const SparrowAtlas* atlas = app.atlases.getCharacter(sourceCharacter);
                     const std::string label = pose.traced
                         ? std::string("Area ") + std::to_string(pose.index + 1)
                         : atlas && pose.index >= 0 && pose.index < static_cast<int>(atlas->frames.size())
