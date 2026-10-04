@@ -54,6 +54,9 @@
 #endif
 
 #include "StageAssetViewer.hpp"
+#include "AtlasBuilder.hpp"
+#include "AtlasPresence.hpp"
+#include <chrono>
 
 namespace {
 
@@ -67,6 +70,11 @@ struct LoadedMod {
     ModExplorerCatalog catalog;
     std::string label;
     std::string singleFile;
+};
+
+struct ModImportResult {
+    std::unique_ptr<LoadedMod> mod;
+    std::string error;
 };
 
 enum class DialogAction { None, Add, AddSingle, ManualDefinition, ManualImage, ManualAtlas, ManualSpritemap, ManualIcon, Recover, Export, BatchExport, AnimationGif, AnimationPng, MountedSheet, PairGifs, PairSceneGif, StageGif, StageSheet, StageZip, StageObjectPng, StageScenePng, StageSceneGif, AssetPosePng, AssetAnimationGif, AssetMountedSheet, AssetSourceZip, AssetBlockPng, AssetAnimationBatch };
@@ -84,7 +92,16 @@ struct ExportJob {
     bool done = false, success = false, reviewed = false;
 };
 
+struct ExportWorkResult {
+    ResourceExportReview review;
+    std::string result;
+    bool success = false;
+};
+
 struct ExportQueueState {
+    BackgroundTask<ExportWorkResult> task;
+    size_t workIndex = 0;
+    bool workReview = false;
     std::vector<ExportJob> jobs;
     fs::path folder;
     int target = 2;
@@ -309,6 +326,18 @@ struct AtlasTabState {
 };
 
 struct AtlasApp {
+    atlas_ui::PresenceOptions presenceOptions;
+    DiscordRpc presence{DiscordRpcConfig{atlas_ui::atlasDiscordApplicationId}};
+    std::int64_t presenceStartedAt = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    double presenceNextTick = 0;
+    bool presenceSettingsRequested = false;
+    std::array<char, 129> presenceImageKey{};
+    atlas_ui::AtlasBuilderState builder;
+    BackgroundTask<ModImportResult> importTask;
+    BackgroundTask<ExportWorkResult> singleExportTask;
+    std::vector<fs::path> pendingImports;
+    std::string importingRoot;
     atlas_ui::StageAssetViewerState assetViewer;
     ExportQueueState exportQueue;
     ExportReviewState exportReview;
@@ -574,17 +603,18 @@ fs::path settingsBase() {
 fs::path galleryPath() {
     const fs::path custom = environmentPath("FUNKIN_ATLAS_GALLERY_PATH");
     if (!custom.empty()) return custom;
-    return settingsBase() / "FunkinAtlas" / "gallery.json";
+    return settingsBase() / "FunkinAtlas2" / "gallery.json";
 }
 
 fs::path oldGalleryPath() {
-    return settingsBase() / "FmlModExplorer" / "gallery.json";
+    return settingsBase() / "FunkinAtlas" / "gallery.json";
 }
 
 void loadGallery(AtlasApp& app) {
     std::ifstream input(galleryPath(), std::ios::binary);
     if (!input && !std::getenv("FUNKIN_ATLAS_GALLERY_PATH"))
         input.open(oldGalleryPath(), std::ios::binary);
+    if (!input && !std::getenv("FUNKIN_ATLAS_GALLERY_PATH")) { input.clear(); input.open(settingsBase() / "FunkinAtlasSneakPeek" / "gallery.json", std::ios::binary); }
     if (!input) return;
     try {
         json data = json::parse(input, nullptr, false);
@@ -606,6 +636,8 @@ void loadGallery(AtlasApp& app) {
                     if (it.value().is_number_integer()) app.engineOverrides[it.key()] = it.value().get<int>();
             const json language = data.value("language", json());
             if (language.is_string()) app.spanish = language.get<std::string>() != "en";
+            app.presenceOptions = atlas_ui::readPresenceOptions(data.value("discordRichPresence", json()));
+            std::snprintf(app.presenceImageKey.data(), app.presenceImageKey.size(), "%s", app.presenceOptions.imageKey.c_str());
             const json panelLayout = data.value("panelLayout", json::object());
             if (panelLayout.is_object()) {
                 const json weights = panelLayout.value("weights", json::array());
@@ -756,6 +788,7 @@ bool saveGallery(const AtlasApp& app) try {
         data["galleryRoots"] = app.galleryRoots;
         data["engineOverrides"] = app.engineOverrides;
         data["language"] = app.spanish ? "es" : "en";
+        data["discordRichPresence"] = atlas_ui::writePresenceOptions(app.presenceOptions);
         data["panelLayout"] = {{"weights", app.panelWeights},
                                {"detached", app.panelDetached},
                                {"previewHeights", app.previewHeights}};
@@ -2154,11 +2187,13 @@ std::string writeSparrowConversion(const fs::path& directory,
         if (!written.ok) return written.error;
         if (!writeText(xmlPath, sheet.xml)) return "Could not write Sparrow XML";
         std::ifstream png(pngPath, std::ios::binary);
-        std::array<std::uint8_t, 33> header{};
-        png.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+        if (!written.bytes || written.bytes > 128u * 1024u * 1024u)
+            return "Written Sparrow PNG exceeds the validation limit";
+        std::vector<std::uint8_t> encoded(written.bytes);
+        png.read(reinterpret_cast<char*>(encoded.data()), static_cast<std::streamsize>(encoded.size()));
         int width = 0, height = 0, channels = 0;
-        if (png.gcount() != static_cast<std::streamsize>(header.size()) ||
-            !stbi_info_from_memory(header.data(), static_cast<int>(header.size()), &width, &height, &channels) ||
+        if (png.gcount() != static_cast<std::streamsize>(encoded.size()) ||
+            !stbi_info_from_memory(encoded.data(), static_cast<int>(encoded.size()), &width, &height, &channels) ||
             width != sheet.png.width || height != sheet.png.height)
             return "Written Sparrow PNG has invalid dimensions";
         std::ifstream xml(xmlPath, std::ios::binary);
@@ -2911,6 +2946,7 @@ SDL_WindowID atlasCurrentWindowId() {
 
 #include "CharacterTools.hpp"
 #include "ExportTools.hpp"
+#include "BaseTasks.hpp"
 
 bool exportStageScenePng(AtlasApp& app, const fs::path& folder);
 bool exportStageSceneGif(AtlasApp& app, const fs::path& folder);
@@ -2990,11 +3026,11 @@ void processDialogResult(AtlasApp& app, const std::string& path, DialogAction ac
         return;
     }
     if (action == DialogAction::Export) {
-        exportReference(app, app.exportReview.source, app.exportReview.target, fs::u8path(path));
+        scheduleResourceExport(app, app.exportReview.source, app.exportReview.target, fs::u8path(path));
         return;
     }
     if (action == DialogAction::AddSingle) {
-        addSingleResource(app, fs::u8path(path));
+        queueModImport(app, fs::u8path(path));
         return;
     }
     if (action == DialogAction::ManualDefinition || action == DialogAction::ManualImage ||
@@ -3007,6 +3043,7 @@ void processDialogResult(AtlasApp& app, const std::string& path, DialogAction ac
         std::snprintf(destination.data(), destination.size(), "%s", path.c_str());
         return;
     }
+    if (action == DialogAction::Add) { queueModImport(app, fs::u8path(path)); return; }
     if (!addMod(app, fs::u8path(path))) return;
     if (action != DialogAction::Recover || app.pendingRecoveryKey.empty()) return;
     const std::string oldKey = app.pendingRecoveryKey.substr(app.pendingRecoveryKey.find('|') + 1);
@@ -3547,8 +3584,17 @@ bool exportCharacterPreviewGif(AtlasApp& app, const fs::path& folder) {
 
 void consumeDroppedPaths(AtlasApp& app) {
     if (app.dropActive || app.droppedPaths.empty()) return;
+    if (app.builder.active && (app.builder.task.active() || app.builder.dialogBusy)) return;
     std::vector<std::string> paths;
     paths.swap(app.droppedPaths);
+    if (app.builder.active) {
+        std::vector<fs::path> files;
+        for (const auto& path : paths) files.push_back(fs::u8path(path));
+        if (files.size() == 1 && files.front().extension() == ".fmlatlas") {
+            atlas_ui::builderRequest(app.builder, atlas_ui::BuilderPending::Open, files.front());
+        } else atlas_ui::builderImportPaths(app.builder, std::move(files));
+        return;
+    }
     const bool manual = ImGui::IsPopupOpen(app.spanish ? "Cargar manualmente###manual-import" : "Load manually###manual-import");
     std::set<std::string> processed;
     for (const std::string& value : paths) {
@@ -3587,10 +3633,169 @@ void consumeDroppedPaths(AtlasApp& app) {
                 continue;
             }
         }
-        if (directory || extension == ".zip") addMod(app, path);
-        else if (extension == ".png" || extension == ".xml" || extension == ".json" || extension == ".lua" || extension == ".txt") addSingleResource(app, path);
+        if (directory || extension == ".zip") queueModImport(app, path);
+        else if (extension == ".png" || extension == ".xml" || extension == ".json" || extension == ".lua" || extension == ".txt") queueModImport(app, path);
         else setStatus(app, "Tipo de archivo no compatible para arrastrar: " + name, "Unsupported drop file type: " + name);
     }
+}
+
+atlas_ui::PresenceContext atlasPresenceContext(const AtlasApp& app) {
+    using namespace atlas_ui;
+    PresenceContext context;
+    context.sources = app.mods.size(); context.playing = app.playing;
+    if (app.songLab.audioPending) context.songState = PresenceSong::Loading;
+    else if (app.songLab.audioLoaded)
+        context.songState = app.songLab.audio.playing() ? PresenceSong::Playing : PresenceSong::Paused;
+    if (context.songState != PresenceSong::None) {
+        context.song = app.songLab.activeSong.id;
+        context.difficulty = app.songLab.activeSong.difficulty;
+        context.variation = app.songLab.activeSong.variation;
+    }
+    const auto* asset = selectedAsset(app);
+    if (asset) {
+        context.source = app.mods[static_cast<size_t>(app.selectedMod)]->label;
+        context.resource = asset->id;
+        context.engine = asset->format == ModExplorerAsset::Format::CodenameXml ? "Codename" :
+            asset->format == ModExplorerAsset::Format::VSliceJson ? "V-Slice" :
+            asset->format == ModExplorerAsset::Format::RawSprite ? "Image / atlas" : "Psych";
+        if (asset->kind == ModExplorerAsset::Kind::Character) {
+            context.tool = PresenceTool::Characters;
+            int animation = app.characterMarkerIndex >= 0 ? app.animator.animIndexOf(static_cast<size_t>(app.characterMarkerIndex)) : app.animationIndex;
+            if (animation >= 0 && animation < static_cast<int>(app.previewCharacter.anims.size()))
+                context.animation = app.previewCharacter.anims[static_cast<size_t>(animation)].name;
+            if (app.secondaryAssetIndex >= 0) context.secondary = app.previewSecondaryCharacter.id;
+        } else {
+            context.tool = PresenceTool::Stages;
+            if (app.selectedStageObject >= 0 && app.selectedStageObject < static_cast<int>(app.previewStage.objects.size())) {
+                const auto& object = app.previewStage.objects[static_cast<size_t>(app.selectedStageObject)];
+                const int animation = app.animator.animIndexOf(static_cast<size_t>(app.selectedStageObject), object);
+                if (animation >= 0 && animation < static_cast<int>(object.anims.size())) context.animation = object.anims[static_cast<size_t>(animation)].name;
+            }
+        }
+    }
+    if (app.builder.active) {
+        context.tool = PresenceTool::Builder; context.resource = app.builder.project.name;
+        context.source.clear(); context.engine.clear(); context.secondary.clear(); context.animation.clear();
+        context.frames = app.builder.project.frames.size(); context.animations = app.builder.project.animations.size(); context.playing = app.builder.playing;
+        if (app.builder.selectedAnimation >= 0 && app.builder.selectedAnimation < static_cast<int>(app.builder.project.animations.size()))
+            context.animation = app.builder.project.animations[static_cast<size_t>(app.builder.selectedAnimation)].name;
+        if (app.builder.task.active() && app.builder.operation == BuilderOperation::Import) context.tool = PresenceTool::Importing;
+        if (app.builder.task.active() && app.builder.operation == BuilderOperation::Export) context.tool = PresenceTool::Exporting;
+    }
+    if (app.comparison.open) { context.tool = PresenceTool::Comparison; context.playing = app.comparison.playing; context.resource.clear(); context.source.clear(); context.animation.clear(); context.secondary.clear(); context.engine.clear(); }
+    if (app.assetViewer.open) {
+        const auto& viewer = app.assetViewer;
+        context.tool = PresenceTool::AssetViewer; context.resource = viewer.resource.object.name; context.source = viewer.sourceLabel;
+        context.engine.clear(); context.secondary.clear(); context.animation.clear(); context.playing = viewer.playing;
+        if (viewer.animation >= 0 && viewer.animation < static_cast<int>(viewer.resource.animations.size())) context.animation = viewer.resource.animations[static_cast<size_t>(viewer.animation)].name;
+    }
+    if (app.importTask.active() || !app.pendingImports.empty()) {
+        context.tool = PresenceTool::Importing; context.resource.clear(); context.source.clear(); context.animation.clear(); context.secondary.clear(); context.engine.clear();
+    }
+    if (app.singleExportTask.active() || app.exportQueue.running ||
+        (app.builder.task.active() && app.builder.operation == BuilderOperation::Export)) {
+        context.tool = PresenceTool::Exporting;
+        if (!app.builder.task.active() || app.builder.operation != BuilderOperation::Export) {
+            context.resource.clear(); context.source.clear(); context.animation.clear(); context.secondary.clear(); context.engine.clear();
+        }
+    }
+    if (app.presenceOptions.prioritizeSong && context.songState == PresenceSong::Playing && !app.songLab.activeSong.sourceLabel.empty())
+        context.source = app.songLab.activeSong.sourceLabel;
+    return context;
+}
+
+void tickAtlasPresence(AtlasApp& app) {
+    if (!app.presenceOptions.enabled || !app.capturePath.empty()) { app.presence.setActivity(std::nullopt); return; }
+    const double now = ImGui::GetTime();
+    if (now < app.presenceNextTick) return;
+    app.presenceNextTick = now + 0.5;
+    app.presence.setActivity(atlas_ui::presencePreview(app.presenceOptions, atlasPresenceContext(app), app.presenceStartedAt));
+}
+
+const char* atlasPresenceStatus(DiscordRpcStatus status, bool es) {
+    switch (status) {
+    case DiscordRpcStatus::Disabled: return es ? "Apagado - no se conecta a Discord" : "Off - no connection to Discord";
+    case DiscordRpcStatus::Waiting: return es ? "Esperando al cliente de Discord" : "Waiting for the Discord desktop client";
+    case DiscordRpcStatus::Connecting: return es ? "Conectando - esperando confirmación" : "Connecting - awaiting confirmation";
+    case DiscordRpcStatus::Ready: return es ? "Conectado - preparando actividad" : "Connected - preparing activity";
+    case DiscordRpcStatus::Updating: return es ? "Conectado - actualización pendiente" : "Connected - update pending";
+    case DiscordRpcStatus::Active: return es ? "Actividad confirmada por Discord" : "Activity acknowledged by Discord";
+    case DiscordRpcStatus::Unsupported: return es ? "No disponible en esta plataforma" : "Unavailable on this platform";
+    default: return es ? "Discord no aceptó la conexión o actividad" : "Discord could not accept the connection or activity";
+    }
+}
+
+void drawAtlasPresenceSettings(AtlasApp& app) {
+    if (app.presenceSettingsRequested) { ImGui::OpenPopup("##discord-presence"); app.presenceSettingsRequested = false; }
+    const auto viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(550, 0), ImVec2(std::min(620.0f, viewport->WorkSize.x - 30), viewport->WorkSize.y - 45));
+    ImVec4 popupColor = ImGui::GetStyleColorVec4(ImGuiCol_PopupBg); popupColor.w = 1;
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, popupColor);
+    if (!ImGui::BeginPopup("##discord-presence", ImGuiWindowFlags_AlwaysAutoResize)) { ImGui::PopStyleColor(); return; }
+    const bool es = app.spanish;
+    auto& options = app.presenceOptions;
+    bool changed = false;
+    ImGui::TextColored(ImVec4(0.89f, 0.76f, 0.57f, 1), "DISCORD RICH PRESENCE");
+    ImGui::Separator();
+    changed |= ImGui::Checkbox(es ? "Mostrar mi actividad en Discord" : "Show my activity on Discord", &options.enabled);
+    ImGui::TextWrapped("%s", es ? "Apagado por defecto. Al activarlo, tu actividad será visible en tu perfil de Discord." : "Off by default. Enabling this makes the selected activity visible on your Discord profile.");
+    const auto snapshot = app.presence.snapshot();
+    ImGui::TextColored(snapshot.status == DiscordRpcStatus::Active ? ImVec4(0.4f, 0.85f, 0.65f, 1) : ImVec4(0.75f, 0.75f, 0.78f, 1), "%s", atlasPresenceStatus(snapshot.status, es));
+    if (!snapshot.error.empty()) ImGui::TextWrapped("%s", snapshot.error.c_str());
+    ImGui::SeparatorText(es ? "QUÉ MOSTRAR" : "WHAT TO SHOW");
+    const char* modesEn[] = {"App only", "Current tool", "Custom - choose details"};
+    const char* modesEs[] = {"Solo la app", "Herramienta actual", "Personalizado - elegir datos"};
+    ImGui::SetNextItemWidth(-1);
+    changed |= ImGui::Combo("##presence-mode", &options.mode, es ? modesEs : modesEn, 3);
+    if (options.mode == 2) {
+        if (ImGui::BeginTable("##presence-fields", ImGui::GetContentRegionAvail().x < 490 ? 1 : 2, ImGuiTableFlags_SizingStretchSame)) {
+            const auto field = [&](const char* en, const char* sp, bool& value) { ImGui::TableNextColumn(); changed |= ImGui::Checkbox(es ? sp : en, &value); };
+            field("Character / stage / project", "Personaje / stage / proyecto", options.showResource);
+            field("Mod name", "Nombre del mod", options.showSource);
+            field("Current animation", "Animación en curso", options.showAnimation);
+            field("Source engine", "Motor de origen", options.showEngine);
+            field("Song name", "Nombre de canción", options.showSong);
+            field("Difficulty / variation", "Dificultad / variación", options.showDifficulty);
+            field("Source / frame counts", "Cantidad de mods / frames", options.showCounts);
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("%s", es ? "Los nombres están ocultos hasta que marques sus opciones." : "Names remain hidden until you select their options.");
+    } else ImGui::TextWrapped("%s", es ? "No comparte nombres de mods, recursos, animaciones o canciones." : "Does not share mod, resource, animation or song names.");
+    const char* typesEn[] = {"Automatic", "Playing", "Listening", "Watching"};
+    const char* typesEs[] = {"Automático", "Jugando", "Escuchando", "Viendo"};
+    ImGui::TextDisabled("%s", es ? "Tipo de actividad" : "Activity type"); ImGui::SetNextItemWidth(-1);
+    changed |= ImGui::Combo("##presence-type", &options.activityType, es ? typesEs : typesEn, 4);
+    changed |= ImGui::Checkbox(es ? "Tiempo de sesión" : "Show session time", &options.showElapsed);
+    changed |= ImGui::Checkbox(es ? "Dar prioridad a la canción en reproducción" : "Prioritize the playing song", &options.prioritizeSong);
+    changed |= ImGui::Checkbox(es ? "Texto de la presencia en español" : "Presence text in Spanish", &options.spanish);
+    if (ImGui::CollapsingHeader(es ? "Imagen de la aplicación (opcional)" : "Application image (optional)")) {
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::InputTextWithHint("##presence-image", es ? "Clave del asset en Discord" : "Discord asset key", app.presenceImageKey.data(), app.presenceImageKey.size())) {
+            options.imageKey = app.presenceImageKey.data(); changed = true;
+        }
+        ImGui::TextWrapped("%s", es ? "Debe existir en los assets de tu aplicación de Discord. Vacío: sin imagen. No sube archivos ni requiere llave pública." : "Must exist in this Discord application's assets. Empty means no image. Does not upload files or require a public key.");
+        if (!options.imageKey.empty() && discordAssetKey(options.imageKey).empty())
+            ImGui::TextWrapped("%s", es ? "Clave no válida: usa letras, números, guion o guion bajo, no rutas ni URLs." : "Invalid key: use letters, numbers, hyphens or underscores, not paths or URLs.");
+    }
+    ImGui::SeparatorText(es ? "VISTA PREVIA LOCAL" : "LOCAL PREVIEW");
+    const auto preview = atlas_ui::presencePreview(options, atlasPresenceContext(app), app.presenceStartedAt);
+    ImGui::TextColored(ImVec4(0.89f, 0.76f, 0.57f, 1), "Funkin Atlas");
+    ImGui::TextWrapped("%s", preview.details.c_str()); ImGui::TextWrapped("%s", preview.state.c_str());
+    const char* type = preview.type == 2 ? (es ? "Escuchando" : "Listening") : preview.type == 3 ? (es ? "Viendo" : "Watching") : (es ? "Jugando" : "Playing");
+    ImGui::TextDisabled("%s%s", type, options.showElapsed ? (es ? " · tiempo de sesión" : " · session time") : "");
+    if (!options.enabled) ImGui::TextColored(ImVec4(0.4f, 0.85f, 0.65f, 1), "%s", es ? "Solo una preview. No se publica." : "Preview only. Not published.");
+    ImGui::TextWrapped("%s", es ? "Detecta la herramienta, reproducción/pausa, importación y exportación. Las actualizaciones se agrupan cada 15 s; apagar retira la presencia. Nunca envía rutas ni ejecuta scripts del mod." : "Detects tools, playback/pause, imports and exports. Updates are coalesced every 15 s; switching off clears the presence. Never sends file paths or executes mod scripts.");
+    if (ImGui::Button(es ? "Restablecer y apagar" : "Reset and switch off")) { options = {}; app.presenceImageKey.fill(0); changed = true; }
+    ImGui::SameLine();
+    if (ImGui::Button(es ? "Cerrar" : "Close")) ImGui::CloseCurrentPopup();
+    if (changed) {
+        app.presence.setActivity(std::nullopt); app.presenceNextTick = ImGui::GetTime() + 0.75;
+        if (!saveGallery(app)) setStatus(app, "No se pudieron guardar las opciones de Discord.", "Discord preferences could not be saved.");
+    }
+    ImGui::EndPopup();
+    ImGui::PopStyleColor();
 }
 
 void drawHeader(AtlasApp& app, SDL_Window* window) {
@@ -3599,9 +3804,15 @@ void drawHeader(AtlasApp& app, SDL_Window* window) {
     ImGui::TextColored(ImVec4(0.89f, 0.76f, 0.57f, 1.0f), "FUNKIN ATLAS - FML TOOL");
     if (ImGui::GetContentRegionAvail().x > 360.0f) ImGui::SameLine();
     ImGui::TextDisabled("/ %s · Drag & drop", es ? "personajes y escenarios" : "character and stage studio");
-    if (ImGui::GetWindowWidth() >= 700.0f)
-        ImGui::SameLine(std::max(16.0f, ImGui::GetWindowContentRegionMax().x - 78.0f));
+    const float presenceButtonWidth = ImGui::CalcTextSize("Discord").x + ImGui::GetStyle().FramePadding.x * 2;
+    const float headerButtons = presenceButtonWidth + 78 + ImGui::GetStyle().ItemSpacing.x;
+    const float headerRight = ImGui::GetWindowContentRegionMax().x - headerButtons;
+    if (ImGui::GetCursorPosX() + ImGui::GetItemRectSize().x < headerRight && ImGui::GetWindowWidth() >= 820)
+        ImGui::SameLine(headerRight);
+    if (ImGui::SmallButton("Discord")) app.presenceSettingsRequested = true;
+    ImGui::SameLine();
     if (ImGui::SmallButton(es ? "ES  /  EN###language" : "EN  /  ES###language")) { app.spanish = !app.spanish; saveGallery(app); }
+    drawAtlasPresenceSettings(app);
     ImGui::Separator();
     const float actionArea = ImGui::GetContentRegionAvail().x;
     const bool inlineActions = actionArea >= 730.0f;
@@ -3618,9 +3829,7 @@ void drawHeader(AtlasApp& app, SDL_Window* window) {
     if (ImGui::Button(es ? "Añadir" : "Add", ImVec2(actionWidth, 0.0f))) {
         const fs::path path = fs::u8path(app.root.data());
         std::error_code ec;
-        if (fs::is_regular_file(path, ec) && lower(path.extension().u8string()) != ".zip")
-            addSingleResource(app, path);
-        else addMod(app, path);
+        queueModImport(app, path);
     }
     ImGui::SameLine();
     if (ImGui::Button(es ? "Carpeta" : "Folder", ImVec2(actionWidth, 0.0f))) {
@@ -4142,6 +4351,8 @@ void drawStageInspector(AtlasApp& app, const LoadedMod& mod, const ModExplorerAs
                         stageObjectKind(object.kind));
             if (canInspectStageAsset(object) && ImGui::Button("Advanced Asset Viewer", ImVec2(-1.0f, 0.0f)))
                 openAdvancedStageAsset(app, static_cast<int>(index));
+            if (canInspectStageAsset(object) && ImGui::Button(es ? "Crear atlas desde capa" : "Create atlas from layer", ImVec2(-1, 0)))
+                importBuilderStageAsset(app);
             const auto visibility = object.properties.find("visible");
             bool shown = visibility == object.properties.end() || visibility->second.asBool();
             if (ImGui::Checkbox(es ? "Visible en preview" : "Visible in preview", &shown))
@@ -4809,6 +5020,9 @@ void drawResourceList(AtlasApp& app) {
                 ImGui::EndDragDropSource();
             }
             if (ImGui::BeginPopupContextItem("##asset-context")) {
+                if (asset.kind == ModExplorerAsset::Kind::Character && asset.valid &&
+                    ImGui::MenuItem(es ? "Crear atlas desde personaje" : "Create atlas from character"))
+                    importBuilderCharacter(app, static_cast<int>(mod), static_cast<int>(index));
                 if (ImGui::MenuItem(es ? "Comparar como A" : "Compare as A")) openComparison(app, 0, static_cast<int>(mod), static_cast<int>(index));
                 if (ImGui::MenuItem(es ? "Comparar como B" : "Compare as B")) openComparison(app, 1, static_cast<int>(mod), static_cast<int>(index));
                 if (ImGui::MenuItem(es ? "Revisar exportación" : "Review export")) openExportReview(app, static_cast<int>(mod), static_cast<int>(index));
@@ -5053,6 +5267,8 @@ void drawAtlasPanel(AtlasApp& app, SDL_Window* window, int panel, bool floating)
 }
 
 void draw(AtlasApp& app, SDL_Window* window) {
+    tickModImports(app);
+    atlas_ui::builderTick(app.builder, app.capturePath.empty());
     processDialog(app);
     songLabPollAudio(app);
     app.sheetBoundsValid = false;
@@ -5063,14 +5279,21 @@ void draw(AtlasApp& app, SDL_Window* window) {
     ImGui::Begin("##funkin-atlas", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
     drawHeader(app, window);
+    drawBaseTasks(app);
     if (ImGui::BeginTabBar("##sections", ImGuiTabBarFlags_None)) {
         const bool requested = app.selectTabOnNextFrame;
         const bool characterOpen = ImGui::BeginTabItem(app.spanish ? "Personajes###characters" : "Characters###characters", nullptr,
-            requested && app.tab == 0 ? ImGuiTabItemFlags_SetSelected : 0);
+            requested && !app.builder.active && app.tab == 0 ? ImGuiTabItemFlags_SetSelected : 0);
         if (characterOpen) ImGui::EndTabItem();
         const bool stageOpen = ImGui::BeginTabItem(app.spanish ? "Escenarios###stages" : "Stages###stages", nullptr,
-            requested && app.tab == 1 ? ImGuiTabItemFlags_SetSelected : 0);
+            requested && !app.builder.active && app.tab == 1 ? ImGuiTabItemFlags_SetSelected : 0);
         if (stageOpen) ImGui::EndTabItem();
+        const bool builderOpen = ImGui::BeginTabItem(app.spanish ? "Crear atlas###atlas-builder" : "Atlas Builder###atlas-builder", nullptr,
+            app.builder.selectNext ? ImGuiTabItemFlags_SetSelected : 0);
+        if (builderOpen) ImGui::EndTabItem();
+        app.builder.selectNext = false;
+        if (builderOpen) app.builder.active = true;
+        else if (characterOpen || stageOpen) app.builder.active = false;
         ImGui::EndTabBar();
         if (requested) app.selectTabOnNextFrame = false;
         else {
@@ -5081,6 +5304,15 @@ void draw(AtlasApp& app, SDL_Window* window) {
                 if (!restoreTabState(app, activeTab)) ensureSelection(app);
             }
         }
+    }
+    if (app.builder.active) {
+        app.previewBoundsValid = app.sheetBoundsValid = false;
+        for (auto& view : app.liveSheetViews) view.boundsValid = false;
+        atlas_ui::drawAtlasBuilder(app.builder, window, app.spanish);
+        atlas_ui::drawBuilderConfirm(app.builder, window, app.spanish);
+        ImGui::End();
+        drawExportTools(app, window);
+        return;
     }
     if (app.tab == 1) {
         const ModExplorerAsset* stage = selectedAsset(app);
@@ -5196,6 +5428,7 @@ void draw(AtlasApp& app, SDL_Window* window) {
         }
         ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + height));
     }
+    atlas_ui::drawBuilderConfirm(app.builder, window, app.spanish);
     ImGui::End();
     const char* titlesEs[3] = {"Datos###atlas-float-data", "Área de trabajo###atlas-float-workspace",
                                "Recursos###atlas-float-resources"};
@@ -5261,7 +5494,7 @@ int main(int argc, char** argv) {
 #ifdef FUNKIN_ATLAS_SONGLAB_EXPERIMENTAL
     SDL_Window* window = SDL_CreateWindow("Funkin Atlas - FML Tool — Song Lab (experimental)", 1360, 860,
 #else
-    SDL_Window* window = SDL_CreateWindow("Funkin Atlas - FML Tool", 1360, 860,
+    SDL_Window* window = SDL_CreateWindow("Funkin Atlas 2.0 - FML Tool", 1360, 860,
 #endif
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) { SDL_Quit(); return 2; }
@@ -5315,11 +5548,18 @@ int main(int argc, char** argv) {
 
     AtlasApp app;
     loadGallery(app);
+    app.builder.recoveryPath = galleryPath().parent_path() / "builder-recovery.fmlatlas";
+    app.builder.recoveryAvailable = fs::is_regular_file(app.builder.recoveryPath, settingsError);
     std::vector<std::string> roots;
     std::string requestedAsset;
     std::string requestedQuick;
     std::string requestedObject;
     std::string requestedExport;
+    bool requestedBuilder = false, requestedBuilderBuild = false, requestedBuilderCharacter = false, requestedBuilderLayer = false;
+    bool requestedBuilderWheel = false;
+    bool requestedBuilderClose = false, builderClosePushed = false;
+    int requestedBuilderEdge = 0;
+    std::string requestedBuilderProject, requestedBuilderImport, requestedBuilderExport;
     int captureFrames = 20;
     std::string requestedSong;
     std::string requestedSongSource;
@@ -5356,6 +5596,21 @@ int main(int argc, char** argv) {
     for (size_t i = 1; i < arguments.size(); ++i) {
         const std::string& argument = arguments[i];
         if (argument.rfind("--capture=", 0) == 0) app.capturePath = argument.substr(10);
+        else if (argument == "--presence-settings") app.presenceSettingsRequested = true;
+        else if (argument == "--atlas-builder") requestedBuilder = true;
+        else if (argument == "--builder-build") requestedBuilderBuild = true;
+        else if (argument == "--builder-character") requestedBuilderCharacter = true;
+        else if (argument == "--builder-layer") requestedBuilderLayer = true;
+        else if (argument == "--check-builder-wheel") requestedBuilderWheel = true;
+        else if (argument == "--check-builder-close") requestedBuilderClose = true;
+        else if (argument.rfind("--builder-size=", 0) == 0) requestedBuilderEdge = std::clamp(std::atoi(argument.c_str() + 15), 16, 8192);
+        else if (argument.rfind("--window=", 0) == 0) {
+            const auto split = argument.find('x', 9);
+            if (split != std::string::npos) SDL_SetWindowSize(window, std::clamp(std::atoi(argument.c_str() + 9), 960, 3840), std::clamp(std::atoi(argument.c_str() + split + 1), 600, 2160));
+        }
+        else if (argument.rfind("--builder-project=", 0) == 0) requestedBuilderProject = argument.substr(18);
+        else if (argument.rfind("--builder-import=", 0) == 0) requestedBuilderImport = argument.substr(17);
+        else if (argument.rfind("--builder-export=", 0) == 0) requestedBuilderExport = lower(argument.substr(17));
         else if (argument.rfind("--capture-frames=", 0) == 0)
             captureFrames = std::clamp(std::atoi(argument.c_str() + 17), 20, 600);
         else if (argument.rfind("--song-lab-select=", 0) == 0)
@@ -5726,7 +5981,11 @@ int main(int argc, char** argv) {
         bool ok = false;
         try {
         ok = !requestedExportDir.empty() && selectedAsset(app) && allowed &&
-            (requestedExport == "batch" ? [&]() { beginExportQueue(app, requestedExportDir); while (app.exportQueue.running) tickExportQueue(app); return !app.exportQueue.jobs.empty() && std::all_of(app.exportQueue.jobs.begin(), app.exportQueue.jobs.end(), [](const ExportJob& job) { return job.done && job.success; }); }() :
+            (requestedExport == "batch" ? [&]() {
+                beginExportQueue(app, requestedExportDir);
+                while (app.exportQueue.running) { tickExportQueue(app); SDL_Delay(1); }
+                return !app.exportQueue.jobs.empty() && std::all_of(app.exportQueue.jobs.begin(), app.exportQueue.jobs.end(), [](const ExportJob& job) { return job.done && job.success; });
+            }() :
              requestedExport == "original" ? exportReference(app, resourceReference(app, app.selectedMod, app.selectedAsset), 0, requestedExportDir) :
              requestedExport == "previewgif" ? exportCharacterPreviewGif(app, requestedExportDir) :
              requestedExport == "pairgifs" ? [&]() {
@@ -5762,9 +6021,25 @@ int main(int argc, char** argv) {
         exitCode = ok ? 0 : 4;
     }
     int frameCount = 0;
+    if (!requestedBuilderExport.empty()) { requestedBuilder = true; requestedBuilderBuild = true; }
+    if (!requestedBuilderProject.empty()) atlas_ui::builderOpen(app.builder, pathFromUtf8(requestedBuilderProject));
+    else if (!requestedBuilderImport.empty()) {
+        std::vector<fs::path> paths;
+        std::istringstream input(requestedBuilderImport); std::string path;
+        while (std::getline(input, path, ';')) if (!path.empty()) paths.push_back(pathFromUtf8(path));
+        atlas_ui::builderImportPaths(app.builder, std::move(paths));
+    } else if (requestedBuilderCharacter) importBuilderCharacter(app, app.selectedMod, app.selectedAsset);
+    else if (requestedBuilderLayer) importBuilderStageAsset(app);
+    if (requestedBuilder || requestedBuilderCharacter || requestedBuilderLayer || !requestedBuilderProject.empty() || !requestedBuilderImport.empty()) {
+        app.builder.active = app.builder.selectNext = true;
+    }
+    const bool builderAutomation = requestedBuilderBuild || !requestedBuilderExport.empty();
+    bool builderFailureReported = false;
     bool wheelCheckPushed = false;
     float wheelCheckStartZoom = 0.0f;
     bool assetWheelCheckPushed = false;
+    bool builderWheelCheckPushed = false;
+    float builderWheelStartZoom = 0;
     float assetWheelStartZoom = 0.0f;
     const float assetStageStartZoom = app.previewZoom;
     for (const auto& path : requestedDrops) {
@@ -5772,6 +6047,25 @@ int main(int argc, char** argv) {
         SDL_PushEvent(&event);
     }
     while (running) {
+        atlas_ui::builderTick(app.builder, app.capturePath.empty());
+        if (builderAutomation && !builderFailureReported && !app.builder.task.active() && !app.builder.failure.empty()) {
+            std::fprintf(stderr, "Atlas Builder failed: %s\n", app.builder.failure.c_str());
+            requestedBuilderBuild = false; requestedBuilderExport.clear(); exitCode = 7; builderFailureReported = true;
+        }
+        if (requestedBuilderBuild && !app.builder.task.active() && app.builder.project.frames.empty()) {
+            std::fprintf(stderr, "Atlas Builder failed: no frames imported\n");
+            requestedBuilderBuild = false; requestedBuilderExport.clear(); exitCode = 7;
+        }
+        if (requestedBuilderBuild && !app.builder.task.active() && !app.builder.project.frames.empty()) {
+            if (requestedBuilderEdge) app.builder.project.options.maxSide = requestedBuilderEdge;
+            if (requestedBuilderExport == "animate") app.builder.project.options.maxPages = std::min(8, app.builder.project.options.maxPages);
+            atlas_ui::builderBuild(app.builder); requestedBuilderBuild = false;
+        }
+        if (!requestedBuilderExport.empty() && !app.builder.task.active() && app.builder.built) {
+            app.builder.project.animate = app.builder.animateExport = requestedBuilderExport == "animate";
+            atlas_ui::builderExport(app.builder, requestedExportDir);
+            requestedBuilderExport.clear();
+        }
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_DROP_BEGIN) app.dropActive = true;
@@ -5788,7 +6082,14 @@ int main(int argc, char** argv) {
                 }
             }
             bool assetWheel = false;
-            if (app.comparison.open && event.type == SDL_EVENT_MOUSE_WHEEL && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+            if (app.builder.active && event.type == SDL_EVENT_MOUSE_WHEEL && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
+                for (atlas_ui::AssetCanvasView* view : {&app.builder.poseView, &app.builder.sheetView, &app.builder.sourceView}) {
+                    if (!view->boundsValid || event.wheel.windowID != view->window || wheelPosition.x < view->min.x ||
+                        wheelPosition.x >= view->max.x || wheelPosition.y < view->min.y || wheelPosition.y >= view->max.y || event.wheel.y == 0) continue;
+                    view->wheel += event.wheel.y; view->wheelPosition = wheelPosition; assetWheel = true; break;
+                }
+            }
+            if (!assetWheel && app.comparison.open && event.type == SDL_EVENT_MOUSE_WHEEL && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) {
                 auto& view = app.comparison.canvas;
                 if (view.boundsValid && event.wheel.windowID == view.window && wheelPosition.x >= view.min.x && wheelPosition.x < view.max.x && wheelPosition.y >= view.min.y && wheelPosition.y < view.max.y && event.wheel.y != 0) {
                     view.wheel += event.wheel.y; view.wheelPosition = wheelPosition; assetWheel = true;
@@ -5846,13 +6147,14 @@ int main(int argc, char** argv) {
             }
             if (liveSheetWheel) continue;
             ImGui_ImplSDL3_ProcessEvent(&event);
-            if (event.type == SDL_EVENT_QUIT) running = false;
+            if (event.type == SDL_EVENT_QUIT) atlas_ui::builderRequest(app.builder, atlas_ui::BuilderPending::Close);
             if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
-                event.window.windowID == SDL_GetWindowID(window)) running = false;
+                event.window.windowID == SDL_GetWindowID(window)) atlas_ui::builderRequest(app.builder, atlas_ui::BuilderPending::Close);
         }
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
+        if (app.builder.closeReady) running = false;
         // Una excepcion a mitad del fotograma (leer un recurso roto, un
         // filesystem_error) cerraba Atlas. Se deshacen las ventanas e IDs que
         // quedaron abiertos y se sigue con el siguiente fotograma.
@@ -5861,6 +6163,7 @@ int main(int argc, char** argv) {
         try {
             draw(app, window);
             drawQuickPreview(app);
+            tickAtlasPresence(app);
         } catch (const std::exception& error) {
             ImGui::ErrorRecoveryTryToRecoverState(&frameRecovery);
             const std::string detail = ensureUtf8(error.what());
@@ -5909,13 +6212,29 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        if (!app.capturePath.empty() && ++frameCount >= captureFrames) {
+        if (requestedBuilderWheel && !builderWheelCheckPushed && app.builder.active && app.builder.poseView.boundsValid) {
+            const auto& view = app.builder.poseView;
+            if (SDL_Window* builderWindow = SDL_GetWindowFromID(view.window)) {
+                int windowX = 0, windowY = 0; SDL_GetWindowPosition(builderWindow, &windowX, &windowY);
+                SDL_Event wheelEvent{}; wheelEvent.type = SDL_EVENT_MOUSE_WHEEL; wheelEvent.wheel.windowID = view.window;
+                wheelEvent.wheel.mouse_x = (view.min.x + view.max.x) * 0.5f - windowX;
+                wheelEvent.wheel.mouse_y = (view.min.y + view.max.y) * 0.5f - windowY; wheelEvent.wheel.y = 1;
+                builderWheelStartZoom = view.zoom; builderWheelCheckPushed = SDL_PushEvent(&wheelEvent);
+            }
+        }
+        if (requestedBuilderClose && !builderClosePushed && frameCount >= 10 && !app.builder.task.active() && app.builder.dirty) {
+            SDL_Event closeEvent{}; closeEvent.type = SDL_EVENT_WINDOW_CLOSE_REQUESTED; closeEvent.window.windowID = SDL_GetWindowID(window);
+            builderClosePushed = SDL_PushEvent(&closeEvent);
+        }
+        if (!app.capturePath.empty() && ++frameCount >= captureFrames && !app.builder.task.active() &&
+            !requestedBuilderBuild && requestedBuilderExport.empty() && !app.importTask.active() && app.pendingImports.empty()) {
             std::vector<unsigned char> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-            stbi_flip_vertically_on_write(1);
+            const size_t stride = static_cast<size_t>(width) * 4;
+            for (int row = 0; row < height / 2; ++row)
+                std::swap_ranges(pixels.begin() + row * stride, pixels.begin() + (row + 1) * stride, pixels.begin() + (height - row - 1) * stride);
             writePngFile(pathFromUtf8(app.capturePath), width, height, pixels.data());
-            stbi_flip_vertically_on_write(0);
             if (requestedWheelCheck) {
                 const bool passed = wheelCheckPushed && app.previewZoom > wheelCheckStartZoom * 1.05f;
                 std::fprintf(passed ? stdout : stderr, "Preview wheel: %s, window %u, zoom %.3f -> %.3f\n",
@@ -5930,6 +6249,19 @@ int main(int argc, char** argv) {
                     passed ? "OK" : "FAILED", assetWheelStartZoom, view.zoom, app.previewZoom);
                 if (!passed) exitCode = 6;
             }
+            if (requestedBuilderWheel) {
+                const bool passed = builderWheelCheckPushed && app.builder.poseView.zoom > builderWheelStartZoom * 1.05f && app.builder.sheetView.zoom == 1;
+                std::fprintf(passed ? stdout : stderr, "Builder wheel isolation: %s, pose %.3f -> %.3f, sheet %.3f\n", passed ? "OK" : "FAILED",
+                    builderWheelStartZoom, app.builder.poseView.zoom, app.builder.sheetView.zoom);
+                if (!passed) exitCode = 8;
+            }
+            if (requestedBuilderClose) {
+                const bool passed = builderClosePushed && app.builder.pending == atlas_ui::BuilderPending::Close && !app.builder.closeReady;
+                std::fprintf(passed ? stdout : stderr, "Builder unsaved-close protection: %s\n", passed ? "OK" : "FAILED");
+                if (!passed) exitCode = 9;
+            }
+            if (builderAutomation && app.builder.built) std::fprintf(stdout, "Atlas Builder: %zu frames, %zu pages, %zu unique images, %zu source warnings\n%s\n",
+                app.builder.built->frames.size(), app.builder.built->pages.size(), app.builder.built->uniqueImages, app.builder.project.sourceWarnings.size(), app.builder.status.c_str());
             if (app.songLab.audioLoaded) {
                 std::fprintf(stdout, "Song Lab time: %.1f / %.1f ms\n",
                     app.songLab.audio.positionMs(), app.songLab.audio.durationMs());
@@ -5950,8 +6282,18 @@ int main(int argc, char** argv) {
         SDL_GL_SwapWindow(window);
     }
     if (app.capturePath.empty() && requestedExport.empty()) saveGallery(app);
+    app.presence.shutdown();
     if (app.stagePoseTexture) glDeleteTextures(1, &app.stagePoseTexture);
     app.assetViewer.releaseTextures();
+    app.builder.task.stop();
+    if (app.capturePath.empty() && app.builder.dirty && !app.builder.recoveryPath.empty()) {
+        std::string recoveryError;
+        saveTextureProject(app.builder.recoveryPath, app.builder.project, recoveryError);
+    }
+    app.builder.releaseTextures();
+    app.importTask.stop();
+    app.exportQueue.task.stop();
+    app.singleExportTask.stop();
     for (MountedViewCache& mounted : app.mountedViews)
         if (mounted.texture) glDeleteTextures(1, &mounted.texture);
     if (app.quickRenderMod >= 0) app.quickRenderer.shutdown();

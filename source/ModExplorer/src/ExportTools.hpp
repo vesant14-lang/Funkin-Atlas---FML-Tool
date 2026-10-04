@@ -97,14 +97,55 @@ void beginExportQueue(AtlasApp& app, const fs::path& parent) {
     queue.next = 0; queue.cancel = false; queue.running = true; queue.manifest.clear();
 }
 
+std::unique_ptr<LoadedMod> exportSourceSnapshot(const AtlasApp& app, const ResourceReference& reference) {
+    const auto [mod, index] = locateResource(app, reference);
+    return mod >= 0 ? std::make_unique<LoadedMod>(*app.mods[mod]) : nullptr;
+}
+
+ExportWorkResult runResourceExport(std::unique_ptr<LoadedMod> snapshot, ResourceReference reference,
+    int target, const fs::path& folder, bool reviewOnly, TaskProgress& progress) {
+    ExportWorkResult result;
+    try {
+        if (!snapshot) { result.result = "Source is no longer loaded"; result.review.errors = {result.result}; return result; }
+        AtlasApp isolated;
+        isolated.mods.push_back(std::move(snapshot));
+        progress.update("Reviewing resource");
+        result.review = inspectExportReference(isolated, reference, target);
+        if (!result.review.ready()) { result.result = result.review.errors.front(); return result; }
+        if (reviewOnly) { result.success = true; return result; }
+        if (progress.cancelled.load()) { result.result = "Operation cancelled"; return result; }
+        progress.update("Converting and writing resource");
+        std::error_code error; fs::create_directories(folder, error);
+        if (error) { result.result = error.message(); return result; }
+        result.success = exportReference(isolated, reference, target, folder); result.result = isolated.statusEn;
+        progress.update("Resource finished", 1, 1);
+    } catch (const std::exception& error) { result.result = ensureUtf8(error.what()); result.review.errors = {result.result}; }
+    catch (...) { result.result = "Unexpected export failure"; result.review.errors = {result.result}; }
+    return result;
+}
+
 void tickExportQueue(AtlasApp& app) {
     auto& queue = app.exportQueue;
+    if (queue.task.ready()) {
+        auto& job = queue.jobs[queue.workIndex];
+        try {
+            auto result = queue.task.take(); job.review = std::move(result.review); job.reviewed = true;
+            if (!queue.workReview) { job.result = std::move(result.result); job.success = result.success; job.done = true; ++queue.next; }
+            else ++queue.reviewNext;
+        } catch (const std::exception& error) {
+            job.result = ensureUtf8(error.what()); job.review.errors = {job.result}; job.reviewed = true;
+            if (queue.workReview) ++queue.reviewNext; else { job.done = true; ++queue.next; }
+        }
+    }
+    if (queue.task.active()) return;
     if (queue.reviewing) {
         if (queue.cancel || queue.reviewNext >= queue.jobs.size()) { queue.reviewing = false; return; }
-        auto& job = queue.jobs[queue.reviewNext++];
-        try { job.review = inspectExportReference(app, job.source, queue.target); }
-        catch (const std::exception& error) { job.review.errors = {ensureUtf8(error.what())}; }
-        job.reviewed = true;
+        const auto reference = queue.jobs[queue.reviewNext].source;
+        auto snapshot = exportSourceSnapshot(app, reference); const int target = queue.target;
+        queue.workIndex = queue.reviewNext; queue.workReview = true;
+        queue.task.start([snapshot = std::move(snapshot), reference, target](TaskProgress& progress) mutable {
+            return runResourceExport(std::move(snapshot), reference, target, {}, true, progress);
+        });
         return;
     }
     if (!queue.running) return;
@@ -117,21 +158,15 @@ void tickExportQueue(AtlasApp& app) {
                        std::string(queue.cancel ? "Batch cancelled: " : "Batch completed: ") + std::to_string(saved) + " saved, " + std::to_string(failed) + " failed. " + queue.manifest);
         return;
     }
-    auto& job = queue.jobs[queue.next];
-    try {
-        job.review = inspectExportReference(app, job.source, queue.target);
-        job.reviewed = true;
-        if (!job.review.ready()) job.result = job.review.errors.front();
-        else {
-            const fs::path destination = queue.folder / fs::u8path(std::to_string(queue.next + 1) + "-" + safeName(job.label));
-            std::error_code error;
-            if (!fs::create_directory(destination, error)) job.result = "Could not create output folder: " + error.message();
-            else { job.success = exportReference(app, job.source, queue.target, destination); job.result = app.statusEn; }
-        }
-    } catch (const std::exception& error) { job.result = ensureUtf8(error.what()); }
-    catch (...) { job.result = "Unexpected export failure"; }
-    job.done = true;
-    ++queue.next;
+    const auto& job = queue.jobs[queue.next];
+    const auto reference = job.source;
+    auto snapshot = exportSourceSnapshot(app, reference);
+    const fs::path destination = queue.folder / fs::u8path(std::to_string(queue.next + 1) + "-" + safeName(job.label));
+    const int target = queue.target;
+    queue.workIndex = queue.next; queue.workReview = false;
+    queue.task.start([snapshot = std::move(snapshot), reference, target, destination](TaskProgress& progress) mutable {
+        return runResourceExport(std::move(snapshot), reference, target, destination, false, progress);
+    });
 }
 
 void drawReviewReport(const ResourceExportReview& review, bool es) {
